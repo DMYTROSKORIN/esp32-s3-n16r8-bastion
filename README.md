@@ -17,6 +17,10 @@ firmware is running to erase the saved network and reopen the wizard.
 See [docs/device-behavior.md](docs/device-behavior.md) for the state machine,
 LED patterns, internet-check behavior, and recovery procedure.
 
+The planned emergency SSH bastion, dual-WireGuard failover, Wake-on-Wireless,
+terminal dashboard, and provisioning security are described in
+[docs/recovery-access-architecture.md](docs/recovery-access-architecture.md).
+
 ## LED status at a glance
 
 | Color | Meaning |
