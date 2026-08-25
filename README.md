@@ -20,6 +20,9 @@ LED patterns, internet-check behavior, and recovery procedure.
 The planned emergency SSH bastion, dual-WireGuard failover, Wake-on-Wireless,
 terminal dashboard, and provisioning security are described in
 [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md).
+The self-documenting SSH console, complete `help` output, command details, and
+recovery examples are specified in
+[docs/cli-reference.md](docs/cli-reference.md).
 
 ## LED status at a glance
 
