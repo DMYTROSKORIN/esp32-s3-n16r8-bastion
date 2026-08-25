@@ -16,3 +16,12 @@ firmware is running to erase the saved network and reopen the wizard.
 
 See [docs/device-behavior.md](docs/device-behavior.md) for the state machine,
 LED patterns, internet-check behavior, and recovery procedure.
+
+## LED status at a glance
+
+| Color | Meaning |
+|---|---|
+| 🟡 Solid yellow | First-run Wi-Fi wizard is active |
+| 🔵 Blue blinking | Connecting or reconnecting to Wi-Fi |
+| 🟢🟢 Two quick green flashes | Wi-Fi and internet are working |
+| 🔴 Fast red blinking | Wi-Fi is connected, but internet access is unavailable |
