@@ -5,6 +5,7 @@
 
 #include "recovery_ssh.h"
 #include "recovery_status.h"
+#include "recovery_vpn.h"
 
 namespace {
 constexpr char kSetupApName[] = "ESP32_SetUp";
@@ -216,6 +217,7 @@ void setup() {
   }
 
   startRecoverySshServer();
+  startRecoveryVpn();
 }
 
 void loop() {

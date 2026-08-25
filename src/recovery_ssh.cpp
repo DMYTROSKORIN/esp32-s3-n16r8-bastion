@@ -9,9 +9,11 @@
 #include <libssh/libssh.h>
 #include <libssh/server.h>
 #include <libssh_esp32.h>
+#include <lwip/sockets.h>
 
 #include "authorized_key.h"
 #include "recovery_status.h"
+#include "recovery_vpn.h"
 
 namespace {
 constexpr char kHostKeyFsPath[] = "/ssh_host_ed25519_key";
@@ -20,10 +22,31 @@ constexpr char kBindAddress[] = "0.0.0.0";
 constexpr char kBindPort[] = "22";
 constexpr uint32_t kSshTaskStack = 32768;
 
+// The server handles one session at a time, so every blocking libssh call must
+// be bounded: a stalled or vanished client would otherwise wedge the recovery
+// console until the board is power-cycled.
+constexpr long kSessionIoTimeoutSeconds = 30;
+constexpr uint32_t kPreShellDeadlineMs = 60000;
+constexpr uint32_t kShellIdleTimeoutMs = 10 * 60 * 1000;
+constexpr uint32_t kRelayIdleTimeoutMs = 10 * 60 * 1000;
+constexpr uint32_t kRelayWriteStallTimeoutMs = 10000;
+constexpr uint8_t kMaxAuthMessages = 16;
+
 const IPAddress kMainPcIp(10, 10, 10, 200);
 const IPAddress kLanBroadcast(10, 10, 10, 255);
 constexpr uint16_t kMainPcSshPort = 22;
 constexpr uint8_t kMainPcMac[] = {0x50, 0x2e, 0x91, 0x8d, 0x24, 0x5a};
+// sshd port of both VPN servers; only used to render copy-paste help commands.
+constexpr uint16_t kVpnServerSshPort = 8326;
+
+constexpr char kAnsiReset[] = "\x1b[0m";
+constexpr char kAnsiBold[] = "\x1b[1m";
+constexpr char kAnsiDim[] = "\x1b[90m";
+constexpr char kAnsiGreen[] = "\x1b[32m";
+constexpr char kAnsiYellow[] = "\x1b[33m";
+constexpr char kAnsiRed[] = "\x1b[31m";
+constexpr char kAnsiCyan[] = "\x1b[36m";
+constexpr char kPrompt[] = "\x1b[1;32mrecovery>\x1b[0m ";
 
 ssh_key authorizedKey = nullptr;
 
@@ -83,31 +106,76 @@ bool mainPcSshReachable(uint32_t timeoutMs = 700) {
   return connected;
 }
 
+void statusRow(ssh_channel channel, const char* label, const char* color,
+               const char* state, const char* detail) {
+  channelPrintf(channel, "  %-10s %s● %-9s%s %s\r\n", label, color, state,
+                kAnsiReset, detail != nullptr ? detail : "");
+}
+
 void writeDashboard(ssh_channel channel) {
   char uptime[32];
   formatUptime(uptime, sizeof(uptime));
   const bool pcOnline = mainPcSshReachable();
+  const bool wifiOnline = WiFi.status() == WL_CONNECTED;
+  const bool internetOnline = recoveryInternetAvailable();
+  const bool vpnOnline = recoveryVpnOnline();
+  const uint32_t handshakeAge = recoveryVpnHandshakeAgeSeconds();
+  const uint8_t vpnFailures = recoveryVpnConsecutiveFailures();
 
-  channelWrite(channel,
-               "\r\nESP32 Recovery Gateway\r\n"
-               "------------------------------------------------\r\n");
-  channelPrintf(channel, "Device              ONLINE   uptime %s\r\n", uptime);
-  channelPrintf(channel, "Wi-Fi               %-8s %d dBm\r\n",
-                WiFi.status() == WL_CONNECTED ? "ONLINE" : "OFFLINE", WiFi.RSSI());
-  channelPrintf(channel, "Internet            %s\r\n",
-                recoveryInternetAvailable() ? "ONLINE" : "OFFLINE");
-  channelWrite(channel, "WireGuard            NOT CONFIGURED\r\n");
-  channelPrintf(channel, "Main PC              %-8s 192.168.1.200\r\n",
-                pcOnline ? "ONLINE" : "OFFLINE");
-  channelPrintf(channel, "SSH :22              %s\r\n", pcOnline ? "OPEN" : "CLOSED");
-  channelWrite(channel, "WoWLAN               READY\r\n");
-  channelPrintf(channel, "Free heap / PSRAM    %u / %u bytes\r\n", ESP.getFreeHeap(),
-                ESP.getFreePsram());
-  channelPrintf(channel, "Last reset           %s\r\n",
-                resetReasonName(esp_reset_reason()));
-  channelWrite(channel,
-               "------------------------------------------------\r\n"
-               "Type 'help' to see commands and examples.\r\n\r\n");
+  char detail[128];
+  channelPrintf(channel,
+                "\r\n  %sESP32 Recovery Gateway%s\r\n"
+                "  ────────────────────────────────────────────────\r\n",
+                kAnsiBold, kAnsiReset);
+
+  snprintf(detail, sizeof(detail), "%suptime %s%s", kAnsiDim, uptime, kAnsiReset);
+  statusRow(channel, "Device", kAnsiGreen, "ONLINE", detail);
+
+  snprintf(detail, sizeof(detail), "%s  %s%d dBm%s", WiFi.SSID().c_str(),
+           kAnsiDim, WiFi.RSSI(), kAnsiReset);
+  statusRow(channel, "Wi-Fi", wifiOnline ? kAnsiGreen : kAnsiRed,
+            wifiOnline ? "ONLINE" : "OFFLINE", wifiOnline ? detail : nullptr);
+
+  statusRow(channel, "Internet", internetOnline ? kAnsiGreen : kAnsiRed,
+            internetOnline ? "ONLINE" : "OFFLINE", nullptr);
+
+  if (handshakeAge != UINT32_MAX) {
+    snprintf(detail, sizeof(detail), "%s  %s%s  %shandshake %lus ago%s",
+             recoveryVpnActiveProfileName(),
+             recoveryVpnAddress().toString().c_str(), kAnsiReset, kAnsiDim,
+             static_cast<unsigned long>(handshakeAge), kAnsiReset);
+  } else {
+    snprintf(detail, sizeof(detail), "%s", recoveryVpnActiveProfileName());
+  }
+  statusRow(channel, "WireGuard", vpnOnline ? kAnsiGreen : kAnsiYellow,
+            recoveryVpnStateName(), detail);
+  if (vpnFailures > 0) {
+    snprintf(detail, sizeof(detail), "%s%u consecutive%s", kAnsiRed, vpnFailures,
+             kAnsiReset);
+    statusRow(channel, "VPN errors", kAnsiRed, "FAILING", detail);
+  }
+
+  snprintf(detail, sizeof(detail), "192.168.1.200  %sssh :22 %s%s", kAnsiDim,
+           pcOnline ? "open" : "closed", kAnsiReset);
+  statusRow(channel, "Main PC", pcOnline ? kAnsiGreen : kAnsiRed,
+            pcOnline ? "ONLINE" : "OFFLINE", detail);
+
+  snprintf(detail, sizeof(detail), "%sAA:BB:CC:DD:EE:FF%s", kAnsiDim, kAnsiReset);
+  statusRow(channel, "WoWLAN", pcOnline ? kAnsiDim : kAnsiGreen,
+            pcOnline ? "STANDBY" : "READY", detail);
+
+  channelPrintf(channel,
+                "  %-10s   %sheap %u KB  psram %u KB  reset: %s%s\r\n",
+                "Memory", kAnsiDim,
+                static_cast<unsigned>(ESP.getFreeHeap() / 1024),
+                static_cast<unsigned>(ESP.getFreePsram() / 1024),
+                resetReasonName(esp_reset_reason()), kAnsiReset);
+
+  channelPrintf(channel,
+                "  ────────────────────────────────────────────────\r\n"
+                "  %shelp%s commands   %spc ssh%s how to reach the PC   %spc wake%s wake it up\r\n\r\n",
+                kAnsiCyan, kAnsiReset, kAnsiCyan, kAnsiReset, kAnsiCyan,
+                kAnsiReset);
 }
 
 void writeHelp(ssh_channel channel) {
@@ -120,9 +188,13 @@ void writeHelp(ssh_channel channel) {
       "MAIN PC\r\n"
       "  pc status              Check 192.168.1.200:22\r\n"
       "  pc wake                Send WoWLAN Magic Packet\r\n"
-      "  pc ssh                 Show the ProxyJump example\r\n\r\n"
+      "  pc ssh                 Show ready-to-use connect commands\r\n\r\n"
       "NETWORK\r\n"
       "  net status             Show Wi-Fi and internet state\r\n\r\n"
+      "VPN\r\n"
+      "  vpn status             Show tunnel and handshake state\r\n"
+      "  vpn failover           Switch to the other profile\r\n"
+      "  vpn retry-primary      Switch to server-1\r\n\r\n"
       "HELP\r\n"
       "  help                   Show this command list\r\n"
       "  help <command>         Show details and examples\r\n"
@@ -144,11 +216,17 @@ void writeDetailedHelp(ssh_channel channel, const String& topic) {
         "Sends the Magic Packet three times, 250 ms apart.\r\n"
         "Example:\r\n  pc status\r\n  pc wake\r\n  pc status\r\n");
   } else if (topic == "pc ssh") {
-    channelWrite(channel,
+    const String tunnelIp = recoveryVpnAddress().toString();
+    channelPrintf(channel,
         "\r\npc ssh - connect through this ESP32 bastion\r\n\r\n"
-        "Run locally after WireGuard is configured:\r\n"
-        "  ssh -J user@<ESP32_VPN_IP> user@192.168.1.200\r\n\r\n"
-        "Only destination 192.168.1.200:22 is permitted.\r\n");
+        "If your device is a VPN client of %s (%s):\r\n"
+        "  %sssh -J user@%s user@192.168.1.200%s\r\n\r\n"
+        "Without a VPN client (jump over the VPN server's sshd):\r\n"
+        "  %sssh -J user@%s:%u,user@%s user@192.168.1.200%s\r\n\r\n"
+        "Only destination 192.168.1.200:22 is permitted.\r\n",
+        recoveryVpnActiveProfileName(), recoveryVpnEndpoint(), kAnsiCyan,
+        tunnelIp.c_str(), kAnsiReset, kAnsiCyan, recoveryVpnEndpoint(),
+        kVpnServerSshPort, tunnelIp.c_str(), kAnsiReset);
   } else if (topic == "status") {
     channelWrite(channel,
         "\r\nstatus - show the complete recovery dashboard\r\n\r\n"
@@ -233,6 +311,26 @@ bool executeCommand(ssh_channel channel, String command) {
                   WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI(),
                   recoveryInternetAvailable() ? "ONLINE" : "OFFLINE",
                   recoveryNetworkStateName());
+  } else if (command == "vpn status") {
+    const uint32_t age = recoveryVpnHandshakeAgeSeconds();
+    channelPrintf(channel,
+                  "\r\nWireGuard: %s\r\nProfile: %s\r\nTunnel IP: %s\r\n"
+                  "Consecutive failures: %u\r\n",
+                  recoveryVpnStateName(), recoveryVpnActiveProfileName(),
+                  recoveryVpnAddress().toString().c_str(),
+                  recoveryVpnConsecutiveFailures());
+    if (age == UINT32_MAX) {
+      channelWrite(channel, "Latest handshake: not available\r\n");
+    } else {
+      channelPrintf(channel, "Latest handshake: %lu seconds ago\r\n",
+                    static_cast<unsigned long>(age));
+    }
+  } else if (command == "vpn failover") {
+    recoveryVpnRequestFailover();
+    channelWrite(channel, "\r\nVPN failover requested. Run 'vpn status' shortly.\r\n");
+  } else if (command == "vpn retry-primary") {
+    recoveryVpnRequestPrimary();
+    channelWrite(channel, "\r\nPrimary VPN retry requested. Run 'vpn status' shortly.\r\n");
   } else if (command == "exit" || command == "quit" || command == "logout") {
     channelWrite(channel, "\r\nBye.\r\n");
     return false;
@@ -269,8 +367,26 @@ bool ensureHostKey() {
   return true;
 }
 
+void hardenSessionTransport(ssh_session session) {
+  long timeoutSeconds = kSessionIoTimeoutSeconds;
+  ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeoutSeconds);
+
+  const socket_t fd = ssh_get_fd(session);
+  if (fd != SSH_INVALID_SOCKET) {
+    int enable = 1;
+    int idleSeconds = 30;
+    int intervalSeconds = 5;
+    int probeCount = 4;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idleSeconds, sizeof(idleSeconds));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intervalSeconds,
+               sizeof(intervalSeconds));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probeCount, sizeof(probeCount));
+  }
+}
+
 bool authenticateSession(ssh_session session) {
-  while (true) {
+  for (uint8_t attempt = 0; attempt < kMaxAuthMessages; ++attempt) {
     ssh_message message = ssh_message_get(session);
     if (message == nullptr) {
       return false;
@@ -305,25 +421,42 @@ bool authenticateSession(ssh_session session) {
       return true;
     }
   }
+  return false;
 }
 
 void serveShell(ssh_channel channel) {
   writeDashboard(channel);
-  channelWrite(channel, "recovery> ");
+  channelWrite(channel, kPrompt);
 
   String line;
+  uint32_t lastActivityMs = millis();
   while (ssh_channel_is_open(channel) && !ssh_channel_is_eof(channel)) {
+    const int available = ssh_channel_poll_timeout(channel, 1000, 0);
+    if (available == 0) {
+      if (millis() - lastActivityMs > kShellIdleTimeoutMs) {
+        channelWrite(channel, "\r\nIdle timeout. Bye.\r\n");
+        return;
+      }
+      continue;
+    }
+    if (available < 0) {
+      return;
+    }
+
     char buffer[64];
-    const int count = ssh_channel_read(channel, buffer, sizeof(buffer), 0);
+    const int count = ssh_channel_read(
+        channel, buffer, min(available, static_cast<int>(sizeof(buffer))), 0);
     if (count <= 0) {
       break;
     }
+    lastActivityMs = millis();
 
     for (int index = 0; index < count; ++index) {
       const char input = buffer[index];
       if (input == 3) {  // Ctrl+C
         line = "";
-        channelWrite(channel, "^C\r\nrecovery> ");
+        channelWrite(channel, "^C\r\n");
+        channelWrite(channel, kPrompt);
       } else if (input == 4) {  // Ctrl+D
         channelWrite(channel, "\r\nBye.\r\n");
         return;
@@ -337,7 +470,8 @@ void serveShell(ssh_channel channel) {
         if (!keepRunning) {
           return;
         }
-        channelWrite(channel, "\r\nrecovery> ");
+        channelWrite(channel, "\r\n");
+        channelWrite(channel, kPrompt);
       } else if (input == 8 || input == 127) {
         if (!line.isEmpty()) {
           line.remove(line.length() - 1);
@@ -351,6 +485,53 @@ void serveShell(ssh_channel channel) {
   }
 }
 
+// Both write sides can accept fewer bytes than offered (a full SSH window or
+// TCP send buffer); dropping the remainder would corrupt the relayed stream,
+// so every chunk is written out completely or the relay is torn down.
+bool writeAllToChannel(ssh_channel channel, const uint8_t* data, int length) {
+  int offset = 0;
+  uint32_t lastProgressMs = millis();
+  while (offset < length) {
+    if (!ssh_channel_is_open(channel)) {
+      return false;
+    }
+    const int written =
+        ssh_channel_write(channel, data + offset, length - offset);
+    if (written == SSH_ERROR) {
+      return false;
+    }
+    if (written > 0) {
+      offset += written;
+      lastProgressMs = millis();
+    } else if (millis() - lastProgressMs > kRelayWriteStallTimeoutMs) {
+      return false;
+    } else {
+      delay(1);
+    }
+  }
+  return true;
+}
+
+bool writeAllToTarget(WiFiClient& target, const uint8_t* data, int length) {
+  int offset = 0;
+  uint32_t lastProgressMs = millis();
+  while (offset < length) {
+    if (!target.connected()) {
+      return false;
+    }
+    const size_t written = target.write(data + offset, length - offset);
+    if (written > 0) {
+      offset += written;
+      lastProgressMs = millis();
+    } else if (millis() - lastProgressMs > kRelayWriteStallTimeoutMs) {
+      return false;
+    } else {
+      delay(1);
+    }
+  }
+  return true;
+}
+
 void relayDirectTcpip(ssh_channel channel) {
   WiFiClient target;
   if (!target.connect(kMainPcIp, kMainPcSshPort, 2000)) {
@@ -358,26 +539,41 @@ void relayDirectTcpip(ssh_channel channel) {
     ssh_channel_close(channel);
     return;
   }
+  target.setNoDelay(true);
 
   ssh_channel_set_blocking(channel, 0);
   uint8_t buffer[1024];
+  uint32_t lastActivityMs = millis();
   while (target.connected() && ssh_channel_is_open(channel) &&
          !ssh_channel_is_eof(channel)) {
+    bool transferred = false;
     const int sshAvailable = ssh_channel_poll(channel, 0);
     if (sshAvailable > 0) {
       const int count = ssh_channel_read_nonblocking(
           channel, buffer, min(sshAvailable, static_cast<int>(sizeof(buffer))), 0);
       if (count > 0) {
-        target.write(buffer, count);
+        if (!writeAllToTarget(target, buffer, count)) {
+          break;
+        }
+        transferred = true;
       }
     }
 
     const int targetAvailable = target.available();
     if (targetAvailable > 0) {
       const int count = target.read(buffer, min(targetAvailable, static_cast<int>(sizeof(buffer))));
-      if (count > 0 && ssh_channel_write(channel, buffer, count) == SSH_ERROR) {
-        break;
+      if (count > 0) {
+        if (!writeAllToChannel(channel, buffer, count)) {
+          break;
+        }
+        transferred = true;
       }
+    }
+
+    if (transferred) {
+      lastActivityMs = millis();
+    } else if (millis() - lastActivityMs > kRelayIdleTimeoutMs) {
+      break;
     }
     delay(1);
   }
@@ -388,7 +584,8 @@ void relayDirectTcpip(ssh_channel channel) {
 }
 
 void handleAuthenticatedSession(ssh_session session) {
-  while (true) {
+  const uint32_t startedMs = millis();
+  while (millis() - startedMs < kPreShellDeadlineMs) {
     ssh_message message = ssh_message_get(session);
     if (message == nullptr) {
       return;
@@ -401,7 +598,7 @@ void handleAuthenticatedSession(ssh_session session) {
         ssh_message_free(message);
 
         bool shellRequested = false;
-        while (!shellRequested) {
+        while (!shellRequested && millis() - startedMs < kPreShellDeadlineMs) {
           ssh_message request = ssh_message_get(session);
           if (request == nullptr) {
             ssh_channel_free(channel);
@@ -424,7 +621,9 @@ void handleAuthenticatedSession(ssh_session session) {
           }
           ssh_message_free(request);
         }
-        serveShell(channel);
+        if (shellRequested) {
+          serveShell(channel);
+        }
         ssh_channel_close(channel);
         ssh_channel_free(channel);
         return;
@@ -486,9 +685,12 @@ void sshServerTask(void*) {
       delay(1000);
       continue;
     }
-    if (ssh_bind_accept(bind, session) == SSH_OK &&
-        ssh_handle_key_exchange(session) == SSH_OK && authenticateSession(session)) {
-      handleAuthenticatedSession(session);
+    if (ssh_bind_accept(bind, session) == SSH_OK) {
+      hardenSessionTransport(session);
+      if (ssh_handle_key_exchange(session) == SSH_OK &&
+          authenticateSession(session)) {
+        handleAuthenticatedSession(session);
+      }
     }
     ssh_disconnect(session);
     ssh_free(session);
