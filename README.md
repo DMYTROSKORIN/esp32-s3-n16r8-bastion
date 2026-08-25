@@ -8,11 +8,11 @@ PlatformIO project for an ESP32-S3 development board with 16 MB flash and
 Open the directory in VS Code with the PlatformIO extension, then use the
 PlatformIO **Upload** action. The serial monitor runs at 115200 baud.
 
-The firmware prints the detected chip, flash and PSRAM sizes and then connects
-to Wi-Fi. On first boot, join the temporary `ESP32-S3-Setup` access point and
-use its captive portal to select the target network. Credentials are stored in
-the ESP32's internal NVS storage and are never committed to this repository.
+The firmware provides a first-run Wi-Fi wizard. If no network is saved, join
+the open `ESP32_SetUp` access point and use its captive portal to select the
+target 2.4 GHz network. Credentials are stored in the ESP32's internal NVS and
+are never committed to this repository. Hold `BOOT` for five seconds while the
+firmware is running to erase the saved network and reopen the wizard.
 
-The onboard RGB LED is yellow during Wi-Fi setup, briefly green after a
-successful connection, blue blinking during normal operation, and red blinking
-if the Wi-Fi connection is lost.
+See [docs/device-behavior.md](docs/device-behavior.md) for the state machine,
+LED patterns, internet-check behavior, and recovery procedure.
