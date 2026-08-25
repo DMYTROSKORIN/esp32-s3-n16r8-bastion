@@ -17,7 +17,19 @@ firmware is running to erase the saved network and reopen the wizard.
 See [docs/device-behavior.md](docs/device-behavior.md) for the state machine,
 LED patterns, internet-check behavior, and recovery procedure.
 
-The planned emergency SSH bastion, dual-WireGuard failover, Wake-on-Wireless,
+The first recovery-access slice is implemented: public-key-only SSH on port 22,
+the terminal dashboard and built-in `help`, WoWLAN for the main PC, and a
+restricted SSH bastion that permits only `192.168.1.200:22`. Connect with:
+
+```sh
+ssh -i ~/.ssh/id_rsa user@192.168.1.120
+```
+
+The ESP32 stores a unique SSH host key in SPIFFS. Only the public half of the
+authorized user key is compiled into the firmware; the private key is not part
+of this repository.
+
+The recovery architecture, planned dual-WireGuard failover, Wake-on-Wireless,
 terminal dashboard, and provisioning security are described in
 [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md).
 The self-documenting SSH console, complete `help` output, command details, and

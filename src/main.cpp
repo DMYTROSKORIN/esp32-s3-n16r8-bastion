@@ -3,6 +3,9 @@
 #include <WiFiClient.h>
 #include <WiFiManager.h>
 
+#include "recovery_ssh.h"
+#include "recovery_status.h"
+
 namespace {
 constexpr char kSetupApName[] = "ESP32_SetUp";
 constexpr uint8_t kBootButtonPin = 0;
@@ -211,6 +214,8 @@ void setup() {
   } else {
     startSetupPortal();
   }
+
+  startRecoverySshServer();
 }
 
 void loop() {
@@ -224,4 +229,12 @@ void loop() {
 
   renderStatusLed();
   delay(5);
+}
+
+const char* recoveryNetworkStateName() {
+  return stateName(deviceState);
+}
+
+bool recoveryInternetAvailable() {
+  return deviceState == DeviceState::kOnline;
 }
