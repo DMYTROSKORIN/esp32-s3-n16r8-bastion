@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Setup</title>
+<style>
+:root{
+  --bg:#f2f4f8;--card:#ffffff;--text:#16181d;--muted:#6b7280;--line:#dde1e8;
+  --accent:#2563eb;--accent-press:#1d4ed8;--err:#dc2626;--ok:#16a34a;
+  --field:#ffffff;--shadow:0 1px 3px rgba(16,24,40,.08)
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0e1013;--card:#181b20;--text:#e8eaed;--muted:#8b929e;--line:#2a2f37;
+  --accent:#3b82f6;--accent-press:#2f6fe0;--err:#f87171;--ok:#34d399;
+  --field:#14161a;--shadow:none
+}}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--text);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased;padding:16px 16px 96px}
+main{max-width:430px;margin:0 auto}
+header{padding:18px 4px 14px}
+h1{font-size:22px;font-weight:700;letter-spacing:-.02em}
+header p{color:var(--muted);font-size:14px;margin-top:2px}
+section{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  box-shadow:var(--shadow);padding:16px;margin-bottom:14px}
+h2{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);margin-bottom:12px}
+label{display:block;font-size:13px;font-weight:500;margin:12px 0 5px}
+label:first-of-type{margin-top:0}
+input,select{width:100%;background:var(--field);color:var(--text);
+  border:1px solid var(--line);border-radius:10px;padding:11px 12px;font-size:16px;
+  font-family:inherit;outline:none;appearance:none;-webkit-appearance:none}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent)}
+select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%236b7280' stroke-width='2'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 12px center;padding-right:34px}
+.row{display:flex;gap:10px}.row>div{flex:1}.row .narrow{flex:0 0 30%}
+.tools{display:flex;justify-content:space-between;align-items:center;margin-top:6px}
+button.link{background:none;border:none;color:var(--accent);font-size:13px;font-weight:500;
+  padding:4px 0;cursor:pointer;font-family:inherit}
+.err{display:none;color:var(--err);font-size:13px;margin-top:5px}
+.err.on{display:block}
+.hint{color:var(--muted);font-size:12.5px;margin-top:5px}
+.filepick{border:1px dashed var(--line);border-radius:10px;padding:12px;
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.filepick-btn{flex:0 0 auto;background:var(--field);color:var(--accent);
+  border:1px solid var(--accent);border-radius:8px;padding:9px 16px;
+  font-size:14px;font-weight:600;font-family:inherit;cursor:pointer}
+.filepick-btn:active{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.filepick-status{flex:1 1 130px;font-size:12.5px;color:var(--muted);word-break:break-word}
+.filepick-status.ok{color:var(--ok)}
+.filepick-status.bad{color:var(--err)}
+.filepick-remove{background:none;border:none;color:var(--muted);font-size:12px;
+  text-decoration:underline;cursor:pointer;font-family:inherit;padding:0;flex:0 0 auto}
+details{margin-top:14px}
+summary{color:var(--accent);font-size:14px;font-weight:500;cursor:pointer;list-style:none;-webkit-user-select:none;user-select:none}
+summary::before{content:"+";display:inline-block;width:16px;font-weight:600}
+details[open] summary::before{content:"–"}
+.applybar{position:fixed;left:0;right:0;bottom:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));
+  background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px)}
+.applybar>div{max-width:430px;margin:0 auto}
+#apply{width:100%;background:var(--accent);color:#fff;border:none;border-radius:12px;
+  padding:14px;font-size:16px;font-weight:600;font-family:inherit;cursor:pointer}
+#apply:active{background:var(--accent-press)}
+#apply:disabled{opacity:.6}
+#formerr{color:var(--err);font-size:13.5px;text-align:center;margin-bottom:8px;display:none}
+#done{display:none;text-align:center;padding:64px 20px}
+#done .mark{width:56px;height:56px;margin:0 auto 18px;border-radius:50%;
+  background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok);
+  font-size:28px;line-height:56px}
+#done h1{margin-bottom:8px}
+#done p{color:var(--muted);font-size:15px}
+</style>
+</head>
+<body>
+<main id="form">
+<header>
+  <h1>ESP32 Recovery Gateway</h1>
+  <p id="subtitle">Initial setup</p>
+</header>
+
+<section>
+  <h2>Wi-Fi</h2>
+  <label for="ssid">Network</label>
+  <select id="ssid" name="ssid"></select>
+  <input id="ssid_manual" placeholder="Network name (SSID)" autocapitalize="none" autocorrect="off" style="display:none;margin-top:8px">
+  <p class="err" data-for="ssid"></p>
+  <div class="tools">
+    <button class="link" type="button" id="rescan">Rescan</button>
+    <span class="hint" id="scanstate">Scanning…</span>
+  </div>
+  <label for="pass">Password</label>
+  <input id="pass" name="pass" type="password" autocomplete="off" placeholder="Leave blank for open networks">
+  <p class="err" data-for="pass"></p>
+  <p class="hint">Checked with a real connection attempt before saving.</p>
+</section>
+
+<section>
+  <h2>Main PC</h2>
+  <div class="row">
+    <div>
+      <label for="pc_ip">IP address</label>
+      <input id="pc_ip" name="pc_ip" inputmode="decimal" placeholder="192.168.1.200">
+    </div>
+    <div class="narrow">
+      <label for="pc_port">SSH port</label>
+      <input id="pc_port" name="pc_port" inputmode="numeric" value="22">
+    </div>
+  </div>
+  <p class="err" data-for="pc_ip"></p>
+  <p class="err" data-for="pc_port"></p>
+  <p class="hint">Used for the bastion, status checks and Wake-on-WLAN. The PC's MAC address is learned automatically.</p>
+</section>
+
+<section>
+  <h2>SSH access</h2>
+  <label for="ssh_user">Username</label>
+  <input id="ssh_user" name="ssh_user" autocapitalize="none" autocorrect="off" placeholder="user">
+  <p class="err" data-for="ssh_user"></p>
+  <label>Public key</label>
+  <div class="filepick" data-field="ssh_key" data-kind="sshkey">
+    <button class="filepick-btn" type="button">Choose file…</button>
+    <input type="file" hidden accept=".pub,.txt,text/plain">
+    <span class="filepick-status">No file selected</span>
+  </div>
+  <input type="hidden" id="ssh_key" name="ssh_key">
+  <p class="err" data-for="ssh_key"></p>
+  <p class="hint">e.g. id_ed25519.pub — ed25519, RSA or ECDSA</p>
+</section>
+
+<section>
+  <h2>WireGuard VPN <span style="text-transform:none;font-weight:400">(optional)</span></h2>
+  <label>Primary profile</label>
+  <div class="filepick" data-field="wg1" data-kind="wgconf">
+    <button class="filepick-btn" type="button">Choose file…</button>
+    <input type="file" hidden accept=".conf,text/plain">
+    <span class="filepick-status">No file selected</span>
+    <button class="filepick-remove" type="button" hidden>Remove</button>
+  </div>
+  <input type="hidden" id="wg1" name="wg1">
+  <p class="err" data-for="wg1"></p>
+  <p class="hint">Standard wg-quick client .conf</p>
+  <details id="wg2box">
+    <summary>Secondary profile (failover)</summary>
+    <label style="margin-top:10px">Secondary profile</label>
+    <div class="filepick" data-field="wg2" data-kind="wgconf">
+      <button class="filepick-btn" type="button">Choose file…</button>
+      <input type="file" hidden accept=".conf,text/plain">
+      <span class="filepick-status">No file selected</span>
+      <button class="filepick-remove" type="button" hidden>Remove</button>
+    </div>
+    <input type="hidden" id="wg2" name="wg2">
+    <p class="err" data-for="wg2"></p>
+  </details>
+</section>
+</main>
+
+<div class="applybar" id="applybar"><div>
+  <p id="formerr"></p>
+  <button id="apply" type="button">Apply &amp; restart</button>
+</div></div>
+
+<div id="done">
+  <div class="mark">✓</div>
+  <h1>Saved</h1>
+  <p>The device is restarting into normal mode.<br>You can close this page.</p>
+</div>
+
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const dirty=new Set();
+let firstRun=true,savedSsid="";
+
+function markDirty(n){dirty.add(n)}
+for(const el of document.querySelectorAll("input[name],select[name]"))
+  el.addEventListener("input",()=>markDirty(el.name));
+
+function checkSshKey(text){
+  const m=text.match(/^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)\s+([A-Za-z0-9+/=]+)/);
+  if(!m)return{ok:false,summary:"not a recognized OpenSSH public key"};
+  return{ok:true,summary:`${m[1]}, ${m[2].length} chars`};
+}
+function checkWgConf(text){
+  if(!/\[Interface\]/i.test(text)||!/\[Peer\]/i.test(text))
+    return{ok:false,summary:"missing [Interface]/[Peer] — is this a wg-quick .conf?"};
+  const ep=text.match(/Endpoint\s*=\s*(\S+)/i);
+  return{ok:true,summary:ep?ep[1]:"looks like a WireGuard profile"};
+}
+
+const filePickers={};
+function setupFilePicker(box){
+  const field=box.dataset.field,kind=box.dataset.kind;
+  const btn=box.querySelector(".filepick-btn");
+  const input=box.querySelector('input[type=file]');
+  const status=box.querySelector(".filepick-status");
+  const removeBtn=box.querySelector(".filepick-remove");
+  const hidden=$(field);
+
+  function setStatus(text,cls){
+    status.textContent=text;
+    status.classList.remove("ok","bad");
+    if(cls)status.classList.add(cls);
+  }
+
+  btn.addEventListener("click",()=>input.click());
+  input.addEventListener("change",()=>{
+    const file=input.files[0];if(!file)return;
+    const reader=new FileReader();
+    reader.onload=()=>{
+      const text=String(reader.result).trim();
+      hidden.value=text;
+      markDirty(field);
+      const check=kind==="sshkey"?checkSshKey(text):checkWgConf(text);
+      setStatus(`${check.ok?"✓":"✗"} ${file.name} — ${check.summary}`,check.ok?"ok":"bad");
+      btn.textContent="Change file…";
+      if(removeBtn)removeBtn.hidden=false;
+    };
+    reader.readAsText(file);
+    input.value="";
+  });
+
+  function clearField(){
+    hidden.value="";
+    markDirty(field);
+    setStatus("No file selected",null);
+    btn.textContent="Choose file…";
+    if(removeBtn)removeBtn.hidden=true;
+  }
+  box.clear=clearField;
+
+  if(removeBtn){
+    removeBtn.addEventListener("click",()=>{
+      clearField();
+      // A secondary profile without a primary is invalid, so removing the
+      // primary clears the secondary too instead of leaving a dead field.
+      if(field==="wg1"&&filePickers.wg2)filePickers.wg2.clear();
+    });
+  }
+
+  box.setSaved=summary=>{
+    setStatus(`Saved: ${summary} — choose a file to replace`,"ok");
+    btn.textContent="Change file…";
+    if(removeBtn)removeBtn.hidden=false;
+  };
+  filePickers[field]=box;
+}
+for(const box of document.querySelectorAll(".filepick"))setupFilePicker(box);
+
+function ssidValue(){
+  return $("ssid").value===" other"?$("ssid_manual").value.trim():$("ssid").value;
+}
+$("ssid").addEventListener("change",()=>{
+  $("ssid_manual").style.display=$("ssid").value===" other"?"block":"none";
+  markDirty("ssid");
+});
+$("ssid_manual").addEventListener("input",()=>markDirty("ssid"));
+
+function fillSsidOptions(list){
+  const sel=$("ssid"),current=ssidValue()||savedSsid,seen=new Set(),opts=[];
+  for(const n of list){
+    if(!n.ssid||seen.has(n.ssid))continue;seen.add(n.ssid);
+    opts.push([n.ssid,`${n.ssid}  (${n.rssi} dBm${n.open?", open":""})`]);
+  }
+  if(current&&!seen.has(current))opts.unshift([current,current]);
+  sel.innerHTML="";
+  for(const[v,t]of opts){const o=new Option(t,v);sel.add(o);}
+  sel.add(new Option("Other…"," other"));
+  if(current)sel.value=current;
+}
+
+let scanTimer=null;
+async function scan(refresh){
+  $("scanstate").textContent="Scanning…";
+  try{
+    const r=await fetch("/api/scan"+(refresh?"?refresh=1":""));
+    const d=await r.json();
+    if(d.status==="pending"){scanTimer=setTimeout(()=>scan(false),1200);return;}
+    fillSsidOptions(d.networks||[]);
+    $("scanstate").textContent=(d.networks||[]).length+" networks";
+  }catch(e){$("scanstate").textContent="Scan failed";}
+}
+$("rescan").addEventListener("click",()=>{clearTimeout(scanTimer);scan(true);});
+
+async function loadConfig(){
+  try{
+    const d=await(await fetch("/api/config")).json();
+    firstRun=!d.provisioned;
+    if(!firstRun){
+      $("subtitle").textContent="Settings — leave a field unchanged to keep its saved value";
+      savedSsid=d.ssid||"";
+      if(d.passSet)$("pass").placeholder="•••••• (saved)";
+      $("pc_ip").value=d.pcIp||"";
+      if(d.pcPort)$("pc_port").value=d.pcPort;
+      $("ssh_user").value=d.sshUser||"";
+      if(d.sshKeySet)filePickers["ssh_key"].setSaved(`${d.sshKeyType} key`);
+      if(d.wg1Set)filePickers["wg1"].setSaved(d.wg1Endpoint);
+      if(d.wg2Set){filePickers["wg2"].setSaved(d.wg2Endpoint);$("wg2box").open=true;}
+      fillSsidOptions([]);
+    }
+  }catch(e){}
+}
+
+function clearErrors(){
+  for(const p of document.querySelectorAll(".err"))p.classList.remove("on");
+  $("formerr").style.display="none";
+}
+function showErrors(errors){
+  let first=null;
+  for(const[k,msg]of Object.entries(errors)){
+    const p=document.querySelector(`.err[data-for="${k}"]`);
+    if(p){p.textContent=msg;p.classList.add("on");first=first||p;}
+    else{$("formerr").textContent=msg;$("formerr").style.display="block";first=first||$("formerr");}
+  }
+  if(first)first.scrollIntoView({block:"center",behavior:"smooth"});
+}
+
+$("apply").addEventListener("click",async()=>{
+  clearErrors();
+  const p=new URLSearchParams();
+  const send=n=>firstRun||dirty.has(n);
+  if(send("ssid"))p.set("ssid",ssidValue());
+  if(send("pass"))p.set("pass",$("pass").value);
+  if(send("pc_ip"))p.set("pc_ip",$("pc_ip").value.trim());
+  if(send("pc_port"))p.set("pc_port",$("pc_port").value.trim());
+  if(send("ssh_user"))p.set("ssh_user",$("ssh_user").value.trim());
+  if(send("ssh_key"))p.set("ssh_key",$("ssh_key").value.trim());
+  if(send("wg1"))p.set("wg1",$("wg1").value.trim());
+  if(send("wg2"))p.set("wg2",$("wg2").value.trim());
+  const btn=$("apply");
+  const testingWifi=send("ssid")||send("pass");
+  btn.disabled=true;
+  btn.textContent=testingWifi?"Connecting to Wi-Fi…":"Applying…";
+  try{
+    const r=await fetch("/api/apply",{method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded"},body:p});
+    if(r.ok){
+      $("form").style.display="none";$("applybar").style.display="none";
+      $("done").style.display="block";window.scrollTo(0,0);
+      return;
+    }
+    const d=await r.json().catch(()=>({errors:{_:"Request failed"}}));
+    showErrors(d.errors||{_:"Request failed"});
+  }catch(e){showErrors({_:"Connection lost — check the ESP32_SetUp network"});}
+  btn.disabled=false;btn.textContent="Apply & restart";
+});
+
+loadConfig().then(()=>scan(false));
+</script>
+</body>
+</html>

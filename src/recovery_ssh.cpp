@@ -3,7 +3,6 @@
 #include <Arduino.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <libssh/libssh.h>
@@ -11,7 +10,8 @@
 #include <libssh_esp32.h>
 #include <lwip/sockets.h>
 
-#include "authorized_key.h"
+#include "device_config.h"
+#include "main_pc.h"
 #include "recovery_status.h"
 #include "recovery_vpn.h"
 
@@ -31,12 +31,8 @@ constexpr uint32_t kShellIdleTimeoutMs = 10 * 60 * 1000;
 constexpr uint32_t kRelayIdleTimeoutMs = 10 * 60 * 1000;
 constexpr uint32_t kRelayWriteStallTimeoutMs = 10000;
 constexpr uint8_t kMaxAuthMessages = 16;
-
-const IPAddress kMainPcIp(10, 10, 10, 200);
-const IPAddress kLanBroadcast(10, 10, 10, 255);
-constexpr uint16_t kMainPcSshPort = 22;
-constexpr uint8_t kMainPcMac[] = {0x50, 0x2e, 0x91, 0x8d, 0x24, 0x5a};
-// sshd port of both VPN servers; only used to render copy-paste help commands.
+// sshd port of the VPN server itself; only used to render copy-paste help
+// commands for jumping over it without a local VPN client.
 constexpr uint16_t kVpnServerSshPort = 8326;
 
 constexpr char kAnsiReset[] = "\x1b[0m";
@@ -49,6 +45,7 @@ constexpr char kAnsiCyan[] = "\x1b[36m";
 constexpr char kPrompt[] = "\x1b[1;32mrecovery>\x1b[0m ";
 
 ssh_key authorizedKey = nullptr;
+char authorizedKeyFingerprint[64] = "unknown";
 
 void channelWrite(ssh_channel channel, const char* text) {
   if (channel != nullptr && text != nullptr) {
@@ -99,13 +96,6 @@ void formatUptime(char* output, size_t outputSize) {
            static_cast<unsigned long>(minutes), static_cast<unsigned long>(secs));
 }
 
-bool mainPcSshReachable(uint32_t timeoutMs = 700) {
-  WiFiClient client;
-  const bool connected = client.connect(kMainPcIp, kMainPcSshPort, timeoutMs);
-  client.stop();
-  return connected;
-}
-
 void statusRow(ssh_channel channel, const char* label, const char* color,
                const char* state, const char* detail) {
   channelPrintf(channel, "  %-10s %s● %-9s%s %s\r\n", label, color, state,
@@ -115,7 +105,7 @@ void statusRow(ssh_channel channel, const char* label, const char* color,
 void writeDashboard(ssh_channel channel) {
   char uptime[32];
   formatUptime(uptime, sizeof(uptime));
-  const bool pcOnline = mainPcSshReachable();
+  const bool pcOnline = mainPcReachable();
   const bool wifiOnline = WiFi.status() == WL_CONNECTED;
   const bool internetOnline = recoveryInternetAvailable();
   const bool vpnOnline = recoveryVpnOnline();
@@ -155,14 +145,19 @@ void writeDashboard(ssh_channel channel) {
     statusRow(channel, "VPN errors", kAnsiRed, "FAILING", detail);
   }
 
-  snprintf(detail, sizeof(detail), "192.168.1.200  %sssh :22 %s%s", kAnsiDim,
-           pcOnline ? "open" : "closed", kAnsiReset);
+  snprintf(detail, sizeof(detail), "%s  %sssh :%u %s%s", gDeviceConfig.pcIp,
+           kAnsiDim, gDeviceConfig.pcPort, pcOnline ? "open" : "closed",
+           kAnsiReset);
   statusRow(channel, "Main PC", pcOnline ? kAnsiGreen : kAnsiRed,
             pcOnline ? "ONLINE" : "OFFLINE", detail);
 
-  snprintf(detail, sizeof(detail), "%sAA:BB:CC:DD:EE:FF%s", kAnsiDim, kAnsiReset);
-  statusRow(channel, "WoWLAN", pcOnline ? kAnsiDim : kAnsiGreen,
-            pcOnline ? "STANDBY" : "READY", detail);
+  char mac[24];
+  mainPcMacString(mac, sizeof(mac));
+  snprintf(detail, sizeof(detail), "%s%s%s", kAnsiDim, mac, kAnsiReset);
+  statusRow(channel, "WoWLAN",
+            pcOnline ? kAnsiDim : (mainPcMacKnown() ? kAnsiGreen : kAnsiYellow),
+            pcOnline ? "STANDBY" : (mainPcMacKnown() ? "READY" : "NO MAC"),
+            detail);
 
   channelPrintf(channel,
                 "  %-10s   %sheap %u KB  psram %u KB  reset: %s%s\r\n",
@@ -186,7 +181,7 @@ void writeHelp(ssh_channel channel) {
       "  uptime                 Show device uptime\r\n"
       "  version                Show firmware and key fingerprint\r\n\r\n"
       "MAIN PC\r\n"
-      "  pc status              Check 192.168.1.200:22\r\n"
+      "  pc status              Check the configured PC's SSH port\r\n"
       "  pc wake                Send WoWLAN Magic Packet\r\n"
       "  pc ssh                 Show ready-to-use connect commands\r\n\r\n"
       "NETWORK\r\n"
@@ -208,30 +203,36 @@ void writeHelp(ssh_channel channel) {
 
 void writeDetailedHelp(ssh_channel channel, const String& topic) {
   if (topic == "pc wake") {
-    channelWrite(channel,
-        "\r\npc wake - wake the main Linux PC over Wi-Fi\r\n\r\n"
+    char mac[24];
+    mainPcMacString(mac, sizeof(mac));
+    channelPrintf(channel,
+        "\r\npc wake - wake the main PC over Wi-Fi\r\n\r\n"
         "Usage: pc wake\r\n"
-        "Target: 192.168.1.200, broadcast 192.168.1.255\r\n"
-        "MAC: AA:BB:CC:DD:EE:FF\r\n\r\n"
+        "Target: %s, broadcast on the local subnet\r\n"
+        "MAC: %s\r\n\r\n"
         "Sends the Magic Packet three times, 250 ms apart.\r\n"
-        "Example:\r\n  pc status\r\n  pc wake\r\n  pc status\r\n");
+        "Example:\r\n  pc status\r\n  pc wake\r\n  pc status\r\n",
+        gDeviceConfig.pcIp, mac);
   } else if (topic == "pc ssh") {
     const String tunnelIp = recoveryVpnAddress().toString();
     channelPrintf(channel,
         "\r\npc ssh - connect through this ESP32 bastion\r\n\r\n"
         "If your device is a VPN client of %s (%s):\r\n"
-        "  %sssh -J user@%s user@192.168.1.200%s\r\n\r\n"
+        "  %sssh -J %s@%s %s@%s%s\r\n\r\n"
         "Without a VPN client (jump over the VPN server's sshd):\r\n"
-        "  %sssh -J user@%s:%u,user@%s user@192.168.1.200%s\r\n\r\n"
-        "Only destination 192.168.1.200:22 is permitted.\r\n",
+        "  %sssh -J %s@%s:%u,%s@%s %s@%s%s\r\n\r\n"
+        "Only destination %s:%u is permitted.\r\n",
         recoveryVpnActiveProfileName(), recoveryVpnEndpoint(), kAnsiCyan,
-        tunnelIp.c_str(), kAnsiReset, kAnsiCyan, recoveryVpnEndpoint(),
-        kVpnServerSshPort, tunnelIp.c_str(), kAnsiReset);
+        gDeviceConfig.sshUser, tunnelIp.c_str(), gDeviceConfig.sshUser,
+        gDeviceConfig.pcIp, kAnsiReset, kAnsiCyan, gDeviceConfig.sshUser,
+        recoveryVpnEndpoint(), kVpnServerSshPort, gDeviceConfig.sshUser,
+        tunnelIp.c_str(), gDeviceConfig.sshUser, gDeviceConfig.pcIp, kAnsiReset,
+        gDeviceConfig.pcIp, gDeviceConfig.pcPort);
   } else if (topic == "status") {
     channelWrite(channel,
         "\r\nstatus - show the complete recovery dashboard\r\n\r\n"
         "Usage: status\r\n"
-        "Checks Wi-Fi, internet state, memory and 192.168.1.200:22.\r\n");
+        "Checks Wi-Fi, internet state, memory and the main PC's SSH port.\r\n");
   } else if (topic == "examples") {
     channelWrite(channel,
         "\r\nCommon recovery scenarios\r\n\r\n"
@@ -246,32 +247,23 @@ void writeDetailedHelp(ssh_channel channel, const String& topic) {
 }
 
 void sendWakePacket(ssh_channel channel) {
-  if (mainPcSshReachable()) {
-    channelWrite(channel, "\r\nMain PC is already online; SSH port 22 is open.\r\n");
+  if (mainPcReachable()) {
+    channelWrite(channel, "\r\nMain PC is already online; SSH port is open.\r\n");
+    return;
+  }
+  if (!mainPcMacKnown()) {
+    channelWrite(channel,
+                "\r\nThe PC's MAC address has not been learned yet.\r\n"
+                "It must appear on the network at least once (powered on) "
+                "before WoWLAN can target it.\r\n");
     return;
   }
 
-  uint8_t packet[102];
-  memset(packet, 0xff, 6);
-  for (size_t repeat = 0; repeat < 16; ++repeat) {
-    memcpy(packet + 6 + repeat * sizeof(kMainPcMac), kMainPcMac,
-           sizeof(kMainPcMac));
-  }
-
-  WiFiUDP udp;
-  udp.begin(9);
-  bool sent = true;
-  for (int attempt = 0; attempt < 3; ++attempt) {
-    sent = udp.beginPacket(kLanBroadcast, 9) == 1 && sent;
-    udp.write(packet, sizeof(packet));
-    sent = udp.endPacket() == 1 && sent;
-    delay(250);
-  }
-  udp.stop();
-
-  channelPrintf(channel,
-                "\r\nWoWLAN packet %s to AA:BB:CC:DD:EE:FF via 192.168.1.255.\r\n",
-                sent ? "sent" : "failed");
+  const bool sent = mainPcWake();
+  char mac[24];
+  mainPcMacString(mac, sizeof(mac));
+  channelPrintf(channel, "\r\nWoWLAN packet %s to %s.\r\n",
+                sent ? "sent" : "failed", mac);
   channelWrite(channel, "Run 'pc status' after the PC has had time to resume.\r\n");
 }
 
@@ -295,10 +287,10 @@ bool executeCommand(ssh_channel channel, String command) {
   } else if (command == "version") {
     channelPrintf(channel,
                   "\r\nFirmware: recovery prototype 0.1\r\nAuthorized key: %s\r\n",
-                  kRecoverySshKeyFingerprint);
+                  authorizedKeyFingerprint);
   } else if (command == "pc status") {
-    channelPrintf(channel, "\r\nMain PC 192.168.1.200:22 is %s.\r\n",
-                  mainPcSshReachable() ? "ONLINE" : "OFFLINE");
+    channelPrintf(channel, "\r\nMain PC %s:%u is %s.\r\n", gDeviceConfig.pcIp,
+                  gDeviceConfig.pcPort, mainPcReachable() ? "ONLINE" : "OFFLINE");
   } else if (command == "pc wake") {
     sendWakePacket(channel);
   } else if (command == "pc ssh") {
@@ -396,7 +388,7 @@ bool authenticateSession(ssh_session session) {
     bool replied = false;
     if (ssh_message_type(message) == SSH_REQUEST_AUTH &&
         ssh_message_subtype(message) == SSH_AUTH_METHOD_PUBLICKEY &&
-        strcmp(ssh_message_auth_user(message), kRecoverySshUser) == 0) {
+        strcmp(ssh_message_auth_user(message), gDeviceConfig.sshUser) == 0) {
       ssh_key offeredKey = ssh_message_auth_pubkey(message);
       if (offeredKey != nullptr &&
           ssh_key_cmp(offeredKey, authorizedKey, SSH_KEY_CMP_PUBLIC) == 0) {
@@ -534,7 +526,9 @@ bool writeAllToTarget(WiFiClient& target, const uint8_t* data, int length) {
 
 void relayDirectTcpip(ssh_channel channel) {
   WiFiClient target;
-  if (!target.connect(kMainPcIp, kMainPcSshPort, 2000)) {
+  IPAddress pcIp;
+  pcIp.fromString(gDeviceConfig.pcIp);
+  if (!target.connect(pcIp, gDeviceConfig.pcPort, 2000)) {
     ssh_channel_send_eof(channel);
     ssh_channel_close(channel);
     return;
@@ -633,8 +627,8 @@ void handleAuthenticatedSession(ssh_session session) {
         const char* destination = ssh_message_channel_request_open_destination(message);
         const int destinationPort =
             ssh_message_channel_request_open_destination_port(message);
-        if (destination != nullptr && strcmp(destination, "192.168.1.200") == 0 &&
-            destinationPort == kMainPcSshPort) {
+        if (destination != nullptr && strcmp(destination, gDeviceConfig.pcIp) == 0 &&
+            destinationPort == gDeviceConfig.pcPort) {
           ssh_channel channel = ssh_message_channel_request_open_reply_accept(message);
           ssh_message_free(message);
           relayDirectTcpip(channel);
@@ -649,15 +643,38 @@ void handleAuthenticatedSession(ssh_session session) {
   }
 }
 
+bool importAuthorizedKey() {
+  const enum ssh_keytypes_e keyType =
+      ssh_key_type_from_name(gDeviceConfig.sshKeyType);
+  if (keyType == SSH_KEYTYPE_UNKNOWN ||
+      ssh_pki_import_pubkey_base64(gDeviceConfig.sshKeyBase64, keyType,
+                                   &authorizedKey) != SSH_OK) {
+    return false;
+  }
+
+  unsigned char* hash = nullptr;
+  size_t hashLength = 0;
+  if (ssh_get_publickey_hash(authorizedKey, SSH_PUBLICKEY_HASH_SHA256, &hash,
+                             &hashLength) == SSH_OK) {
+    char* fingerprint =
+        ssh_get_fingerprint_hash(SSH_PUBLICKEY_HASH_SHA256, hash, hashLength);
+    ssh_clean_pubkey_hash(&hash);
+    if (fingerprint != nullptr) {
+      snprintf(authorizedKeyFingerprint, sizeof(authorizedKeyFingerprint), "%s",
+               fingerprint);
+      ssh_string_free_char(fingerprint);
+    }
+  }
+  return true;
+}
+
 void sshServerTask(void*) {
   while (WiFi.status() != WL_CONNECTED) {
     delay(250);
   }
 
   libssh_begin();
-  if (!ensureHostKey() ||
-      ssh_pki_import_pubkey_base64(kRecoverySshPublicKeyBase64, SSH_KEYTYPE_RSA,
-                                   &authorizedKey) != SSH_OK) {
+  if (!ensureHostKey() || !importAuthorizedKey()) {
     Serial.println("SSH: initialization failed");
     vTaskDelete(nullptr);
     return;
@@ -677,7 +694,7 @@ void sshServerTask(void*) {
     return;
   }
   Serial.printf("SSH: listening on %s:%s as %s\n", WiFi.localIP().toString().c_str(),
-                kBindPort, kRecoverySshUser);
+                kBindPort, gDeviceConfig.sshUser);
 
   while (true) {
     ssh_session session = ssh_new();

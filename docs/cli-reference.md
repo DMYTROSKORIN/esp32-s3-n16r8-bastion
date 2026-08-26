@@ -41,7 +41,8 @@ recovery>
 - Строка `VPN errors` появляется только при последовательных неудачах
   health-check.
 - `WoWLAN` показывает `READY` с MAC-адресом, когда ПК офлайн и его можно
-  будить, и `STANDBY`, когда ПК уже онлайн.
+  будить, `STANDBY`, когда ПК уже онлайн, и `NO MAC`, если MAC ещё не был
+  выучен (ПК ни разу не появлялся в сети после настройки/сброса).
 - `reset:` — причина последней перезагрузки
   (power-on / software / panic / watchdog / brownout).
 
@@ -59,7 +60,7 @@ STATUS
   version                Show firmware and key fingerprint
 
 MAIN PC
-  pc status              Check 192.168.1.200:22
+  pc status              Check the configured PC's SSH port
   pc wake                Send WoWLAN Magic Packet
   pc ssh                 Show ready-to-use connect commands
 
@@ -96,34 +97,29 @@ HELP
 - один или несколько готовых примеров;
 - связанный следующий шаг.
 
-Пример `help pc wake`:
+Пример `help pc wake` (адрес и MAC подставляются из текущей конфигурации;
+`pc wake` отказывает с понятным сообщением, если MAC ещё не выучен):
 
 ```text
-pc wake — wake the main Linux PC over Wi-Fi
+pc wake - wake the main PC over Wi-Fi
 
-Usage:
-  pc wake
+Usage: pc wake
+Target: 192.168.1.200, broadcast on the local subnet
+MAC: AA:BB:CC:DD:EE:FF
 
-Target:
-  IP         192.168.1.200
-  Broadcast  192.168.1.255
-  MAC        AA:BB:CC:DD:EE:FF
-
-Action:
-  Sends the WoWLAN Magic Packet three times, 250 ms apart.
-  Then checks 192.168.1.200:22 for up to 90 seconds.
-
+Sends the Magic Packet three times, 250 ms apart.
 Example:
-  pc wake
-
-Possible results:
-  PC is already online
-  Wake packet sent; PC became reachable after 18s
-  Wake packet sent; timeout waiting for SSH
-
-See also:
   pc status
-  pc ssh
+  pc wake
+  pc status
+```
+
+Пока MAC не выучен, команда вместо этого отвечает:
+
+```text
+The PC's MAC address has not been learned yet.
+It must appear on the network at least once (powered on)
+before WoWLAN can target it.
 ```
 
 Пример `help vpn failover`:
@@ -220,11 +216,11 @@ ESP32 не хранит пароль Linux и приватный SSH-ключ п
 Реализовано:
 
 - Разрешена только SSH-аутентификация по public key (один авторизованный
-  ключ пользователя `user`, скомпилирован в прошивку); максимум
-  16 auth-сообщений на сессию.
+  ключ, имя пользователя и сам ключ задаются через портал настройки и
+  хранятся в NVS); максимум 16 auth-сообщений на сессию.
 - ESP32 никогда не показывает private key, preshared key или пароль Wi-Fi.
-- SSH bastion разрешает только назначение `192.168.1.200:22`; запрос любого
-  другого `direct-tcpip`-назначения отклоняется.
+- SSH bastion разрешает только назначение `<PC IP>:<PC port>` из текущей
+  конфигурации; запрос любого другого `direct-tcpip`-назначения отклоняется.
 - Сервер обслуживает одну сессию за раз. Пока открыт проброшенный туннель к
   ПК, консоль недоступна (и наоборот).
 - Защита от зависших клиентов: 30 с на key exchange/аутентификацию
