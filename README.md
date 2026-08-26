@@ -1,7 +1,8 @@
-# ESP32-S3 N16R8
+# ESP32-S3-N16R8 Bastion
 
-PlatformIO project for an ESP32-S3 development board with 16 MB flash and
-8 MB Octal PSRAM.
+PlatformIO project for an ESP32-S3 development board (16 MB flash, 8 MB
+Octal PSRAM) acting as an emergency-access SSH/WireGuard bastion for a
+Linux PC on the same LAN.
 
 ## Build and upload
 
