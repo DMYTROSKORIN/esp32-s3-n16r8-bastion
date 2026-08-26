@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <libssh/libssh.h>
@@ -29,7 +30,11 @@ constexpr long kSessionIoTimeoutSeconds = 30;
 constexpr uint32_t kPreShellDeadlineMs = 60000;
 constexpr uint32_t kShellIdleTimeoutMs = 10 * 60 * 1000;
 constexpr uint32_t kRelayIdleTimeoutMs = 10 * 60 * 1000;
-constexpr uint32_t kRelayWriteStallTimeoutMs = 10000;
+// Heavy, frequently-redrawing TUI apps (btop) can push far more data than a
+// mobile-tethered client's link can drain in a hiccup; 10 s was tearing down
+// sessions that were merely congested, not dead. 30 s gives real congestion
+// room to clear while still catching a genuinely gone client reasonably fast.
+constexpr uint32_t kRelayWriteStallTimeoutMs = 30000;
 constexpr uint8_t kMaxAuthMessages = 16;
 // sshd port of the VPN server itself; only used to render copy-paste help
 // commands for jumping over it without a local VPN client.
@@ -485,17 +490,30 @@ bool writeAllToChannel(ssh_channel channel, const uint8_t* data, int length) {
   uint32_t lastProgressMs = millis();
   while (offset < length) {
     if (!ssh_channel_is_open(channel)) {
+      Serial.println("Relay: channel no longer open before write");
       return false;
     }
     const int written =
         ssh_channel_write(channel, data + offset, length - offset);
     if (written == SSH_ERROR) {
+      Serial.printf(
+          "Relay: ssh_channel_write error: %s | internal free=%u largest=%u "
+          "| default free=%u largest=%u\n",
+          ssh_get_error(ssh_channel_get_session(channel)),
+          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+          static_cast<unsigned>(
+              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DEFAULT)),
+          static_cast<unsigned>(
+              heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT)));
       return false;
     }
     if (written > 0) {
       offset += written;
       lastProgressMs = millis();
     } else if (millis() - lastProgressMs > kRelayWriteStallTimeoutMs) {
+      Serial.printf("Relay: channel write stalled, remote window=%u\n",
+                    ssh_channel_window_size(channel));
       return false;
     } else {
       delay(1);
@@ -535,7 +553,18 @@ void relayDirectTcpip(ssh_channel channel) {
   }
   target.setNoDelay(true);
 
-  ssh_channel_set_blocking(channel, 0);
+  // Reads still use the explicit non-blocking primitives below regardless of
+  // this flag (ssh_channel_poll/ssh_channel_read_nonblocking always force
+  // their own non-blocking mode internally, per libssh's channels.c). Writes
+  // are what need real blocking: in non-blocking mode, ssh_channel_write()
+  // silently queues data into session->out_buffer instead of respecting the
+  // remote's actual drain rate, and that buffer only ever grows (realloc'd in
+  // powers of two) until one such realloc fails outright with ENOMEM - the
+  // "ssh_socket_write: Out of memory" seen live once btop's output outran
+  // what the link could carry (htop never generates enough to hit it).
+  // Blocking mode makes ssh_channel_write() genuinely wait on the socket,
+  // bounded by the session's 30 s I/O timeout set in hardenSessionTransport.
+  ssh_channel_set_blocking(channel, 1);
   uint8_t buffer[1024];
   uint32_t lastActivityMs = millis();
   uint32_t totalToTarget = 0;

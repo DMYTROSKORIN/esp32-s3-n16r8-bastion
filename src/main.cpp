@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <esp_heap_caps.h>
 #include <math.h>
 
 #include "device_config.h"
@@ -262,6 +263,16 @@ void handleNetworkState() {
 void setup() {
   Serial.begin(115200);
   delay(1500);
+
+  // The Arduino core already routes large mallocs to PSRAM (~7 MB, vs.
+  // ~320 KB of internal RAM); lower the threshold further so libssh's much
+  // smaller per-packet buffers land there too. Under sustained high-volume
+  // traffic (a full-screen TUI redrawing constantly) those small internal
+  // allocations fragment the tiny internal heap until one fails outright
+  // with ENOMEM, killing the relay - confirmed live via
+  // "ssh_socket_write: Out of memory" while htop (much lighter output)
+  // never triggers it.
+  heap_caps_malloc_extmem_enable(512);
 
   pinMode(kBootButtonPin, INPUT_PULLUP);
 
