@@ -538,17 +538,25 @@ void relayDirectTcpip(ssh_channel channel) {
   ssh_channel_set_blocking(channel, 0);
   uint8_t buffer[1024];
   uint32_t lastActivityMs = millis();
+  uint32_t totalToTarget = 0;
+  uint32_t totalToChannel = 0;
   while (target.connected() && ssh_channel_is_open(channel) &&
          !ssh_channel_is_eof(channel)) {
     bool transferred = false;
     const int sshAvailable = ssh_channel_poll(channel, 0);
+    if (sshAvailable < 0) {
+      Serial.printf("Relay: ssh_channel_poll error %d, closing\n", sshAvailable);
+      break;
+    }
     if (sshAvailable > 0) {
       const int count = ssh_channel_read_nonblocking(
           channel, buffer, min(sshAvailable, static_cast<int>(sizeof(buffer))), 0);
       if (count > 0) {
         if (!writeAllToTarget(target, buffer, count)) {
+          Serial.println("Relay: write to target PC stalled/failed, closing");
           break;
         }
+        totalToTarget += count;
         transferred = true;
       }
     }
@@ -558,8 +566,10 @@ void relayDirectTcpip(ssh_channel channel) {
       const int count = target.read(buffer, min(targetAvailable, static_cast<int>(sizeof(buffer))));
       if (count > 0) {
         if (!writeAllToChannel(channel, buffer, count)) {
+          Serial.println("Relay: write to SSH channel stalled/failed, closing");
           break;
         }
+        totalToChannel += count;
         transferred = true;
       }
     }
@@ -567,11 +577,18 @@ void relayDirectTcpip(ssh_channel channel) {
     if (transferred) {
       lastActivityMs = millis();
     } else if (millis() - lastActivityMs > kRelayIdleTimeoutMs) {
+      Serial.println("Relay: idle timeout, closing");
       break;
     }
     delay(1);
   }
 
+  Serial.printf(
+      "Relay: closing (target connected=%d, channel open=%d, channel eof=%d) "
+      "bytes to-target=%u to-channel=%u heap=%u\n",
+      target.connected(), ssh_channel_is_open(channel),
+      ssh_channel_is_eof(channel), totalToTarget, totalToChannel,
+      static_cast<unsigned>(ESP.getFreeHeap()));
   target.stop();
   ssh_channel_send_eof(channel);
   ssh_channel_close(channel);

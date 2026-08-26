@@ -5,6 +5,7 @@
 #include <WiFiClient.h>
 #include <WiFiUdp.h>
 #include <lwip/etharp.h>
+#include <lwip/ip4_addr.h>
 #include <lwip/netif.h>
 #include <lwip/tcpip.h>
 #include <string.h>
@@ -32,13 +33,20 @@ struct ArpQuery {
 // with its owner, and this Arduino core builds without TCPIP core locking.
 void arpLookupInTcpipThread(void* argument) {
   ArpQuery* query = static_cast<ArpQuery*>(argument);
-  struct eth_addr* ethRet = nullptr;
-  const ip4_addr_t* ipRet = nullptr;
-  if (netif_default != nullptr &&
-      etharp_find_addr(netif_default, &query->ip, &ethRet, &ipRet) >= 0 &&
-      ethRet != nullptr) {
-    memcpy(query->mac, ethRet->addr, 6);
-    query->found = true;
+  // Scan every entry instead of using etharp_find_addr(netif_default, ...):
+  // on this Arduino-ESP32/esp_netif build, lwIP's netif_default does not
+  // reliably match the netif the Wi-Fi STA's ARP entries are recorded
+  // under, so filtering by it drops entries that are genuinely present.
+  for (uint8_t slot = 0; slot < ARP_TABLE_SIZE; ++slot) {
+    ip4_addr_t* entryIp = nullptr;
+    struct netif* entryNetif = nullptr;
+    struct eth_addr* entryEth = nullptr;
+    if (etharp_get_entry(slot, &entryIp, &entryNetif, &entryEth) &&
+        entryIp != nullptr && ip4_addr_cmp(entryIp, &query->ip)) {
+      memcpy(query->mac, entryEth->addr, 6);
+      query->found = true;
+      break;
+    }
   }
   xSemaphoreGive(query->done);
 }
@@ -85,14 +93,17 @@ bool mainPcReachable(uint32_t timeoutMs) {
 }
 
 void mainPcMaintain() {
-  const uint32_t now = millis();
-  if (now - lastMaintainMs < kMaintainIntervalMs && lastMaintainMs != 0) {
-    return;
-  }
-  lastMaintainMs = now;
+  // Only start the cooldown once Wi-Fi is actually up, so a premature call
+  // during the connecting phase doesn't burn the first real attempt.
   if (WiFi.status() != WL_CONNECTED || gDeviceConfig.pcIp[0] == '\0') {
     return;
   }
+  const uint32_t now = millis();
+  if (lastMaintainMs != 0 && now - lastMaintainMs < kMaintainIntervalMs) {
+    return;
+  }
+  lastMaintainMs = now;
+
   ensureMacLoaded();
   if (!mainPcReachable(kMaintainProbeTimeoutMs)) {
     return;
