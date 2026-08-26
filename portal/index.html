@@ -120,7 +120,7 @@ details[open] summary::before{content:"–"}
   <label>Public key</label>
   <div class="filepick" data-field="ssh_key" data-kind="sshkey">
     <button class="filepick-btn" type="button">Choose file…</button>
-    <input type="file" hidden accept=".pub,.txt,text/plain">
+    <input type="file" hidden>
     <span class="filepick-status">No file selected</span>
   </div>
   <input type="hidden" id="ssh_key" name="ssh_key">
@@ -133,7 +133,7 @@ details[open] summary::before{content:"–"}
   <label>Primary profile</label>
   <div class="filepick" data-field="wg1" data-kind="wgconf">
     <button class="filepick-btn" type="button">Choose file…</button>
-    <input type="file" hidden accept=".conf,text/plain">
+    <input type="file" hidden>
     <span class="filepick-status">No file selected</span>
     <button class="filepick-remove" type="button" hidden>Remove</button>
   </div>
@@ -145,7 +145,7 @@ details[open] summary::before{content:"–"}
     <label style="margin-top:10px">Secondary profile</label>
     <div class="filepick" data-field="wg2" data-kind="wgconf">
       <button class="filepick-btn" type="button">Choose file…</button>
-      <input type="file" hidden accept=".conf,text/plain">
+      <input type="file" hidden>
       <span class="filepick-status">No file selected</span>
       <button class="filepick-remove" type="button" hidden>Remove</button>
     </div>

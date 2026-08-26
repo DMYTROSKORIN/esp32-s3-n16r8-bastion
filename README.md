@@ -35,9 +35,9 @@ client by jumping over the VPN server's sshd (the `pc ssh` console command
 always prints these with the currently active addresses and username):
 
 ```sh
-ssh user@10.66.0.6                                              # console
-ssh -J user@10.66.0.6 user@192.168.1.200                       # bastion
-ssh -J user@203.0.113.10:8326,user@10.66.0.6 user@192.168.1.200
+ssh user@10.66.0.2                                              # console
+ssh -J user@10.66.0.2 user@192.168.1.200                       # bastion
+ssh -J user@203.0.113.10:2222,user@10.66.0.2 user@192.168.1.200
 ```
 
 The ESP32 stores a unique SSH host key in SPIFFS, generated on first boot and

@@ -10,6 +10,11 @@ SSH-консоль ESP32 должна быть понятной без внеш�
 файловой системе не поддерживаются. Консоль содержит только безопасный набор
 операций для диагностики и восстановления связи.
 
+Без доступа к SSH то же самое (Wi-Fi/интернет/VPN-профиль) частично видно по
+встроенному RGB LED — см. таблицу цветов в
+[recovery-access-architecture.md](recovery-access-architecture.md#индикация-состояния-rgb-led)
+или полное описание в [device-behavior.md](device-behavior.md).
+
 ## Начальный экран
 
 Реализованный dashboard использует ANSI-цвета: индикатор ● в каждой строке
@@ -21,9 +26,9 @@ SSH-консоль ESP32 должна быть понятной без внеш�
   ESP32 Recovery Gateway
   ────────────────────────────────────────────────
   Device     ● ONLINE    uptime 0d 00:07:44
-  Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm
+  Wi-Fi      ● ONLINE    HomeWiFi-5GHz  -51 dBm
   Internet   ● ONLINE
-  WireGuard  ● ONLINE    server-1  10.66.0.6  handshake 10s ago
+  WireGuard  ● ONLINE    profile-1  10.66.0.2  handshake 10s ago
   Main PC    ● ONLINE    192.168.1.200  ssh :22 open
   WoWLAN     ● STANDBY   AA:BB:CC:DD:EE:FF
   Memory       heap 199 KB  psram 8166 KB  reset: power-on
@@ -70,7 +75,7 @@ NETWORK
 VPN
   vpn status             Show tunnel and handshake state
   vpn failover           Switch to the other profile
-  vpn retry-primary      Switch to server-1
+  vpn retry-primary      Switch to profile-1
 
 HELP
   help                   Show this command list
@@ -154,11 +159,11 @@ See also:
 ```text
 pc ssh - connect through this ESP32 bastion
 
-If your device is a VPN client of server-1 (203.0.113.10):
-  ssh -J user@10.66.0.6 user@192.168.1.200
+If your device is a VPN client of profile-1 (203.0.113.10):
+  ssh -J user@10.66.0.2 user@192.168.1.200
 
 Without a VPN client (jump over the VPN server's sshd):
-  ssh -J user@203.0.113.10:8326,user@10.66.0.6 user@192.168.1.200
+  ssh -J user@203.0.113.10:2222,user@10.66.0.2 user@192.168.1.200
 
 Only destination 192.168.1.200:22 is permitted.
 ```
