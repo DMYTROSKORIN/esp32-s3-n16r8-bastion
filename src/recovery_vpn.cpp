@@ -2,6 +2,7 @@
 
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <atomic>
 #include <esp_wireguard.h>
 #include <time.h>
 
@@ -11,6 +12,12 @@ namespace {
 constexpr uint32_t kTaskStack = 16384;
 constexpr uint32_t kHealthIntervalMs = 10000;
 constexpr uint32_t kConnectRetryMs = 1000;
+// esp_wireguard_connect() returns ESP_ERR_RETRY while its DNS lookup is
+// still in flight (dns_gethostbyname() == ERR_INPROGRESS). Without a
+// deadline, an endpoint whose hostname never resolves (DNS outage, typo,
+// expired domain) would retry here forever - no failover, no response to
+// `vpn failover`/`vpn retry-primary`, stuck in CONNECTING indefinitely.
+constexpr uint32_t kConnectDeadlineMs = 20000;
 constexpr uint32_t kInitialGraceMs = 30000;
 constexpr uint32_t kMaxHandshakeAgeSeconds = 180;
 constexpr uint8_t kFailuresBeforeFailover = 3;
@@ -30,16 +37,26 @@ enum class VpnState : uint8_t {
   kDegraded,
 };
 
+// A newly issued request always replaces whatever was pending, so the most
+// recent console command wins instead of two flags racing to be handled in
+// arrival order.
+enum class VpnRequest : uint8_t { kNone, kFailover, kPrimary };
+
 wireguard_config_t wireGuardConfig = ESP_WIREGUARD_CONFIG_DEFAULT();
 wireguard_ctx_t wireGuardContext = ESP_WIREGUARD_CONTEXT_DEFAULT();
 volatile VpnState vpnState = VpnState::kNotConfigured;
 volatile int8_t activeProfile = -1;
 volatile uint8_t consecutiveFailures = 0;
 volatile uint32_t handshakeAgeSeconds = UINT32_MAX;
-volatile bool failoverRequested = false;
-volatile bool primaryRequested = false;
+std::atomic<VpnRequest> pendingRequest{VpnRequest::kNone};
 bool tunnelInitialized = false;
 uint32_t profileStartedMs = 0;
+
+void noteFailure() {
+  if (consecutiveFailures < UINT8_MAX) {
+    ++consecutiveFailures;
+  }
+}
 
 const char* stateName(VpnState state) {
   switch (state) {
@@ -117,13 +134,21 @@ bool startProfile(uint8_t index) {
   tunnelInitialized = true;
 
   esp_err_t result;
+  const uint32_t connectStartMs = millis();
   do {
     result = esp_wireguard_connect(&wireGuardContext);
     if (result == ESP_ERR_RETRY) {
       delay(kConnectRetryMs);
     }
-  } while (result == ESP_ERR_RETRY && WiFi.status() == WL_CONNECTED);
+  } while (result == ESP_ERR_RETRY && WiFi.status() == WL_CONNECTED &&
+           millis() - connectStartMs < kConnectDeadlineMs);
 
+  if (result == ESP_ERR_RETRY) {
+    Serial.printf("WireGuard: profile %u connect timed out (DNS never resolved?)\n",
+                  index + 1);
+    stopTunnel();
+    return false;
+  }
   if (result != ESP_OK) {
     Serial.printf("WireGuard: profile %u connect failed: %d\n", index + 1,
                   result);
@@ -220,13 +245,15 @@ void vpnTask(void*) {
       desiredProfile = 0;
     }
 
-    if (primaryRequested) {
-      primaryRequested = false;
-      desiredProfile = 0;
-      stopTunnel();
-    } else if (failoverRequested) {
-      failoverRequested = false;
-      if (profileCount() > 1) {
+    // Atomic read-and-clear: a request stored by the console right after
+    // this line reads is never dropped, it simply becomes next cycle's
+    // pending request instead of being overwritten by the kNone reset below.
+    const VpnRequest request = pendingRequest.exchange(VpnRequest::kNone);
+    if (request != VpnRequest::kNone) {
+      if (request == VpnRequest::kPrimary) {
+        desiredProfile = 0;
+        stopTunnel();
+      } else if (profileCount() > 1) {
         desiredProfile = activeProfile == 0 ? 1 : 0;
         stopTunnel();
       }
@@ -234,7 +261,7 @@ void vpnTask(void*) {
 
     if (!tunnelInitialized) {
       if (!startProfile(desiredProfile)) {
-        consecutiveFailures++;
+        noteFailure();
         if (profileCount() > 1 && consecutiveFailures >= kFailuresBeforeFailover) {
           desiredProfile = desiredProfile == 0 ? 1 : 0;
           consecutiveFailures = 0;
@@ -268,7 +295,7 @@ void vpnTask(void*) {
       continue;
     }
 
-    consecutiveFailures++;
+    noteFailure();
     Serial.printf("WireGuard: profile %u health check failed (%u/%u)\n",
                   activeProfile + 1, consecutiveFailures, kFailuresBeforeFailover);
     if (profileCount() > 1 && consecutiveFailures >= kFailuresBeforeFailover) {
@@ -282,13 +309,15 @@ void vpnTask(void*) {
 }  // namespace
 
 void startRecoveryVpn() {
-  xTaskCreatePinnedToCore(vpnTask, "recovery-vpn", kTaskStack, nullptr, 3,
-                          nullptr, 1);
+  if (xTaskCreatePinnedToCore(vpnTask, "recovery-vpn", kTaskStack, nullptr, 3,
+                              nullptr, 1) != pdPASS) {
+    Serial.println("WireGuard: failed to create VPN task");
+  }
 }
 
-void recoveryVpnRequestFailover() { failoverRequested = true; }
+void recoveryVpnRequestFailover() { pendingRequest.store(VpnRequest::kFailover); }
 
-void recoveryVpnRequestPrimary() { primaryRequested = true; }
+void recoveryVpnRequestPrimary() { pendingRequest.store(VpnRequest::kPrimary); }
 
 bool recoveryVpnConfigured() { return profileCount() > 0; }
 

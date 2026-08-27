@@ -144,6 +144,9 @@ bool handleAddress(Parser& parser, const char* value, WgProfileConfig& profile,
     if (*addressSeen) {
       return parser.fail("exactly one IPv4 Interface Address is required");
     }
+    if (address == 0) {
+      return parser.fail("Interface Address cannot be 0.0.0.0");
+    }
     *addressSeen = true;
     formatIpv4(address, profile.address, sizeof(profile.address));
     formatIpv4(prefixToMask(prefix), profile.netmask, sizeof(profile.netmask));
@@ -197,6 +200,11 @@ bool handleEndpoint(Parser& parser, const char* value,
                    sizeof(profile.endpoint)) ||
       profile.endpoint[0] == '\0') {
     return parser.fail("Endpoint host is empty or too long");
+  }
+  for (const char* c = profile.endpoint; *c != '\0'; ++c) {
+    if (!isalnum(static_cast<unsigned char>(*c)) && *c != '.' && *c != '-') {
+      return parser.fail("Endpoint host has invalid characters");
+    }
   }
   if (!parseUint16(separator + 1, 1, 65535, &profile.port)) {
     return parser.fail("Endpoint port is out of range");
@@ -343,6 +351,23 @@ bool parseWireGuardConf(const char* text, WgProfileConfig& profile,
   }
   if (profile.routeCount == 0) {
     return parser.fail("at least one IPv4 AllowedIPs entry is required");
+  }
+  // The firmware makes this tunnel the default route and health-checks it by
+  // reaching 1.1.1.1/8.8.8.8 through the interface (recovery_vpn.cpp). A
+  // split-tunnel AllowedIPs that excludes those addresses would make an
+  // otherwise healthy profile look permanently down and trigger endless
+  // failover thrashing, so a full-tunnel route is required up front.
+  bool hasDefaultRoute = false;
+  for (uint8_t i = 0; i < profile.routeCount; ++i) {
+    if (strcmp(profile.routes[i].address, "0.0.0.0") == 0 &&
+        strcmp(profile.routes[i].netmask, "0.0.0.0") == 0) {
+      hasDefaultRoute = true;
+      break;
+    }
+  }
+  if (!hasDefaultRoute) {
+    return parser.fail("AllowedIPs must include 0.0.0.0/0 (this device "
+                       "routes and health-checks through the tunnel)");
   }
   return true;
 }

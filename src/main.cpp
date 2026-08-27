@@ -277,7 +277,7 @@ void setup() {
   pinMode(kBootButtonPin, INPUT_PULLUP);
 
   Serial.println();
-  Serial.println("ESP32-S3 N16R8 starting");
+  Serial.println("ESP32-S3-N16R8 Bastion starting");
   Serial.printf("Chip: %s rev %d | Flash: %u MB | PSRAM: %u MB\n",
                 ESP.getChipModel(), ESP.getChipRevision(),
                 ESP.getFlashChipSize() / (1024U * 1024U),

@@ -53,6 +53,14 @@ void arpLookupInTcpipThread(void* argument) {
 
 bool arpLookup(const IPAddress& ip, uint8_t mac[6]) {
   static SemaphoreHandle_t done = xSemaphoreCreateBinary();
+  if (done == nullptr) {
+    return false;
+  }
+  // A callback from a previous call that timed out here can still fire
+  // later and give the semaphore; drain any such leftover token first so
+  // this call's own wait below can't be satisfied by stale data.
+  while (xSemaphoreTake(done, 0) == pdTRUE) {
+  }
   static ArpQuery query;
   query.found = false;
   query.done = done;

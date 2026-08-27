@@ -127,30 +127,17 @@ It must appear on the network at least once (powered on)
 before WoWLAN can target it.
 ```
 
-Пример `help vpn failover`:
+`help <command>` реализована подробно только для `pc wake`, `pc ssh`,
+`status` и `examples` (см. выше и ниже). Для любой другой команды, включая
+`vpn failover`, `vpn status`, `net status` и т. д., ответ сейчас —
+универсальная заглушка:
 
 ```text
-vpn failover — switch to the standby WireGuard profile
-
-Usage:
-  vpn failover
-
-Action:
-  Closes the active tunnel, activates the other configured profile,
-  and verifies its handshake and health endpoint.
-
-The command never prints private or preshared keys.
-
-Example:
-  vpn status
-  vpn failover
-  vpn status
-
-See also:
-  vpn peers
-  vpn retry-primary
-  vpn history
+No detailed help for 'vpn failover'. Type 'help' for all commands.
 ```
+
+Расширение подробной справки на остальные команды по реестру команд
+(см. «Требование к реализации» ниже) — не реализовано, план.
 
 Фактический вывод `pc ssh` (адреса подставляются динамически из активного
 профиля — после failover команды печатаются уже с адресами резервного
@@ -176,7 +163,7 @@ ESP32 не хранит пароль Linux и приватный SSH-ключ п
 ## Готовые сценарии
 
 Команда `help examples` показывает последовательности для типичных аварий.
-Сценарии из текущей прошивки:
+Фактический вывод в текущей прошивке — ровно два сценария:
 
 ### Основной VPN на ПК не работает
 
@@ -184,9 +171,7 @@ ESP32 не хранит пароль Linux и приватный SSH-ключ п
 1. status
 2. pc status
 3. pc ssh
-4. Выйти из консоли ESP32
-5. Выполнить напечатанную ProxyJump-команду локально
-6. Перезапустить WireGuard на Linux-ПК
+   Then run the displayed ProxyJump command locally.
 ```
 
 ### ПК находится в режиме сна
@@ -194,10 +179,11 @@ ESP32 не хранит пароль Linux и приватный SSH-ключ п
 ```text
 1. pc status
 2. pc wake
-3. Подождать выход ПК из сна (десятки секунд)
-4. pc status
-5. pc ssh
+3. pc status
 ```
+
+Ниже — дополнительные сценарии для этого же класса отказов, полезные как
+справочник, но **не входящие** в реальный вывод `help examples`:
 
 ### Активный VPN-сервер недоступен
 

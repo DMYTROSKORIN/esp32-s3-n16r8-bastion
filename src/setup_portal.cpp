@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <ctype.h>
+#include <libssh/libssh.h>
 #include <mbedtls/base64.h>
 #include <string.h>
 
@@ -186,6 +187,11 @@ bool validIpv4String(const char* text, char* canonical, size_t canonicalSize) {
   if (!ip.fromString(text)) {
     return false;
   }
+  // Reject addresses that can never be a real host on the LAN: 0.0.0.0/8,
+  // multicast (224-239) and the reserved/broadcast range (240-255).
+  if (ip[0] == 0 || ip[0] >= 224) {
+    return false;
+  }
   snprintf(canonical, canonicalSize, "%s", ip.toString().c_str());
   return true;
 }
@@ -202,6 +208,34 @@ bool validSshUser(const char* user) {
     }
   }
   return true;
+}
+
+// An OpenSSH public key blob is a sequence of SSH wire-format fields, each a
+// 4-byte big-endian length prefix followed by that many bytes. Verifying the
+// whole blob decodes as such - consuming every byte with no overrun and no
+// leftover - catches truncated/corrupted keys that happen to start with a
+// valid algorithm-name field, which the length-prefix-only check below does
+// not: such a key would otherwise save successfully, then fail
+// ssh_pki_import_pubkey_base64() after reboot with no way back in except
+// physically re-entering the setup portal.
+bool isWellFormedSshWireFields(const unsigned char* data, size_t length) {
+  size_t offset = 0;
+  bool sawField = false;
+  while (offset < length) {
+    if (length - offset < 4) {
+      return false;
+    }
+    const uint32_t fieldLength = (static_cast<uint32_t>(data[offset]) << 24) |
+                                 (data[offset + 1] << 16) |
+                                 (data[offset + 2] << 8) | data[offset + 3];
+    offset += 4;
+    if (fieldLength > length - offset) {
+      return false;
+    }
+    offset += fieldLength;
+    sawField = true;
+  }
+  return sawField;
 }
 
 // Accepts "type base64 [comment]" and verifies the base64 blob's embedded
@@ -254,13 +288,29 @@ bool parseSshPublicKey(const char* text, char* typeOut, size_t typeSize,
                                   (decoded[1] << 16) | (decoded[2] << 8) |
                                   decoded[3];
   if (embeddedLength != typeLength ||
-      memcmp(decoded + 4, typeOut, typeLength) != 0) {
+      memcmp(decoded + 4, typeOut, typeLength) != 0 ||
+      !isWellFormedSshWireFields(decoded, decodedLength)) {
     return false;
   }
 
   memcpy(keyOut, base64, base64Length);
   keyOut[base64Length] = '\0';
-  return true;
+
+  // The checks above catch truncation and gross corruption but don't know
+  // each algorithm's field semantics (e.g. an ed25519 key's second field
+  // must be exactly 32 bytes, RSA's e/n must be well-formed mpints) - a key
+  // could still pass them yet fail to import. Settle it for real with the
+  // exact function the SSH server calls after every reboot, so a bad key is
+  // rejected here instead of silently disabling the recovery console until
+  // someone re-enters this portal in person.
+  ssh_key trial = nullptr;
+  const bool importable =
+      ssh_pki_import_pubkey_base64(keyOut, ssh_key_type_from_name(typeOut),
+                                   &trial) == SSH_OK;
+  if (trial != nullptr) {
+    ssh_key_free(trial);
+  }
+  return importable;
 }
 
 // Attempts a real STA connection with the given credentials while the setup

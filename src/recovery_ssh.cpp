@@ -3,7 +3,6 @@
 #include <Arduino.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
-#include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <libssh/libssh.h>
@@ -52,9 +51,40 @@ constexpr char kPrompt[] = "\x1b[1;32mrecovery>\x1b[0m ";
 ssh_key authorizedKey = nullptr;
 char authorizedKeyFingerprint[64] = "unknown";
 
+// A single ssh_channel_write() call can accept fewer bytes than offered (a
+// full SSH window or TCP send buffer); dropping the remainder would corrupt
+// or truncate the output, so every call retries until the whole chunk is
+// sent, the channel is gone, or nothing progresses for too long.
+bool writeAllToChannel(ssh_channel channel, const uint8_t* data, int length) {
+  int offset = 0;
+  uint32_t lastProgressMs = millis();
+  while (offset < length) {
+    if (!ssh_channel_is_open(channel)) {
+      return false;
+    }
+    const int written =
+        ssh_channel_write(channel, data + offset, length - offset);
+    if (written == SSH_ERROR) {
+      Serial.printf("SSH: channel write error: %s\n",
+                    ssh_get_error(ssh_channel_get_session(channel)));
+      return false;
+    }
+    if (written > 0) {
+      offset += written;
+      lastProgressMs = millis();
+    } else if (millis() - lastProgressMs > kRelayWriteStallTimeoutMs) {
+      return false;
+    } else {
+      delay(1);
+    }
+  }
+  return true;
+}
+
 void channelWrite(ssh_channel channel, const char* text) {
   if (channel != nullptr && text != nullptr) {
-    ssh_channel_write(channel, text, strlen(text));
+    writeAllToChannel(channel, reinterpret_cast<const uint8_t*>(text),
+                      static_cast<int>(strlen(text)));
   }
 }
 
@@ -291,7 +321,7 @@ bool executeCommand(ssh_channel channel, String command) {
     channelPrintf(channel, "\r\nUptime: %s\r\n", uptime);
   } else if (command == "version") {
     channelPrintf(channel,
-                  "\r\nFirmware: recovery prototype 0.1\r\nAuthorized key: %s\r\n",
+                  "\r\nFirmware: recovery-access bastion\r\nAuthorized key: %s\r\n",
                   authorizedKeyFingerprint);
   } else if (command == "pc status") {
     channelPrintf(channel, "\r\nMain PC %s:%u is %s.\r\n", gDeviceConfig.pcIp,
@@ -345,7 +375,23 @@ bool ensureHostKey() {
     return false;
   }
   if (SPIFFS.exists(kHostKeyFsPath)) {
-    return true;
+    // A file existing isn't proof it is a loadable key - a prior brownout or
+    // full flash could have left a truncated/empty one, which would only
+    // surface later as ssh_bind_listen() failing on every boot with no
+    // self-heal, disabling the recovery console until someone re-enters the
+    // setup portal in person. Confirm it actually imports before trusting it.
+    ssh_key existing = nullptr;
+    const bool loads = ssh_pki_import_privkey_file(kHostKeyVfsPath, nullptr,
+                                                   nullptr, nullptr,
+                                                   &existing) == SSH_OK;
+    if (existing != nullptr) {
+      ssh_key_free(existing);
+    }
+    if (loads) {
+      return true;
+    }
+    Serial.println("SSH: existing host key is unreadable, regenerating");
+    SPIFFS.remove(kHostKeyFsPath);
   }
 
   Serial.println("SSH: generating unique Ed25519 host key");
@@ -426,6 +472,7 @@ void serveShell(ssh_channel channel) {
   channelWrite(channel, kPrompt);
 
   String line;
+  line.reserve(128);
   uint32_t lastActivityMs = millis();
   while (ssh_channel_is_open(channel) && !ssh_channel_is_eof(channel)) {
     const int available = ssh_channel_poll_timeout(channel, 1000, 0);
@@ -476,52 +523,13 @@ void serveShell(ssh_channel channel) {
         }
       } else if (input >= 32 && input <= 126 && line.length() < 127) {
         line += input;
-        ssh_channel_write(channel, &input, 1);
+        writeAllToChannel(channel, reinterpret_cast<const uint8_t*>(&input), 1);
       }
     }
   }
 }
 
-// Both write sides can accept fewer bytes than offered (a full SSH window or
-// TCP send buffer); dropping the remainder would corrupt the relayed stream,
-// so every chunk is written out completely or the relay is torn down.
-bool writeAllToChannel(ssh_channel channel, const uint8_t* data, int length) {
-  int offset = 0;
-  uint32_t lastProgressMs = millis();
-  while (offset < length) {
-    if (!ssh_channel_is_open(channel)) {
-      Serial.println("Relay: channel no longer open before write");
-      return false;
-    }
-    const int written =
-        ssh_channel_write(channel, data + offset, length - offset);
-    if (written == SSH_ERROR) {
-      Serial.printf(
-          "Relay: ssh_channel_write error: %s | internal free=%u largest=%u "
-          "| default free=%u largest=%u\n",
-          ssh_get_error(ssh_channel_get_session(channel)),
-          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-          static_cast<unsigned>(
-              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
-          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DEFAULT)),
-          static_cast<unsigned>(
-              heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT)));
-      return false;
-    }
-    if (written > 0) {
-      offset += written;
-      lastProgressMs = millis();
-    } else if (millis() - lastProgressMs > kRelayWriteStallTimeoutMs) {
-      Serial.printf("Relay: channel write stalled, remote window=%u\n",
-                    ssh_channel_window_size(channel));
-      return false;
-    } else {
-      delay(1);
-    }
-  }
-  return true;
-}
-
+// Mirrors writeAllToChannel() above but for the WiFiClient side of the relay.
 bool writeAllToTarget(WiFiClient& target, const uint8_t* data, int length) {
   int offset = 0;
   uint32_t lastProgressMs = millis();
@@ -553,40 +561,49 @@ void relayDirectTcpip(ssh_channel channel) {
   }
   target.setNoDelay(true);
 
-  // Reads still use the explicit non-blocking primitives below regardless of
-  // this flag (ssh_channel_poll/ssh_channel_read_nonblocking always force
-  // their own non-blocking mode internally, per libssh's channels.c). Writes
-  // are what need real blocking: in non-blocking mode, ssh_channel_write()
-  // silently queues data into session->out_buffer instead of respecting the
-  // remote's actual drain rate, and that buffer only ever grows (realloc'd in
-  // powers of two) until one such realloc fails outright with ENOMEM - the
-  // "ssh_socket_write: Out of memory" seen live once btop's output outran
-  // what the link could carry (htop never generates enough to hit it).
-  // Blocking mode makes ssh_channel_write() genuinely wait on the socket,
-  // bounded by the session's 30 s I/O timeout set in hardenSessionTransport.
+  // Blocking mode so ssh_channel_write() below gives real backpressure
+  // instead of silently buffering unboundedly (see docs/recovery-access-
+  // architecture.md, "Надёжность", for why). Reads are unaffected: the
+  // ssh_channel_poll/ssh_channel_read_nonblocking calls further down always
+  // force their own non-blocking mode regardless of this flag.
   ssh_channel_set_blocking(channel, 1);
   uint8_t buffer[1024];
   uint32_t lastActivityMs = millis();
   uint32_t totalToTarget = 0;
   uint32_t totalToChannel = 0;
-  while (target.connected() && ssh_channel_is_open(channel) &&
-         !ssh_channel_is_eof(channel)) {
+  const char* closeReason = "peer closed";
+  // A client that closes its write side (SSH EOF) only means "no more input
+  // coming from me" - the PC may still be mid-response. Stop forwarding
+  // client->PC once that happens, but keep draining PC->client until the PC
+  // itself disconnects or goes idle, instead of tearing down both directions
+  // immediately and discarding whatever the PC was about to send back.
+  bool clientDone = false;
+  while (target.connected() && ssh_channel_is_open(channel)) {
     bool transferred = false;
-    const int sshAvailable = ssh_channel_poll(channel, 0);
-    if (sshAvailable < 0) {
-      Serial.printf("Relay: ssh_channel_poll error %d, closing\n", sshAvailable);
-      break;
+    if (!clientDone && ssh_channel_is_eof(channel)) {
+      clientDone = true;
+      // Half-close the PC side too (TCP FIN on our write direction) so a
+      // program that only replies once it sees EOF on its input isn't left
+      // waiting for more input that will never come.
+      shutdown(target.fd(), SHUT_WR);
     }
-    if (sshAvailable > 0) {
-      const int count = ssh_channel_read_nonblocking(
-          channel, buffer, min(sshAvailable, static_cast<int>(sizeof(buffer))), 0);
-      if (count > 0) {
-        if (!writeAllToTarget(target, buffer, count)) {
-          Serial.println("Relay: write to target PC stalled/failed, closing");
-          break;
+    if (!clientDone) {
+      const int sshAvailable = ssh_channel_poll(channel, 0);
+      if (sshAvailable < 0) {
+        closeReason = "channel poll error";
+        break;
+      }
+      if (sshAvailable > 0) {
+        const int count = ssh_channel_read_nonblocking(
+            channel, buffer, min(sshAvailable, static_cast<int>(sizeof(buffer))), 0);
+        if (count > 0) {
+          if (!writeAllToTarget(target, buffer, count)) {
+            closeReason = "write to PC stalled/failed";
+            break;
+          }
+          totalToTarget += count;
+          transferred = true;
         }
-        totalToTarget += count;
-        transferred = true;
       }
     }
 
@@ -595,7 +612,7 @@ void relayDirectTcpip(ssh_channel channel) {
       const int count = target.read(buffer, min(targetAvailable, static_cast<int>(sizeof(buffer))));
       if (count > 0) {
         if (!writeAllToChannel(channel, buffer, count)) {
-          Serial.println("Relay: write to SSH channel stalled/failed, closing");
+          closeReason = "write to client stalled/failed";
           break;
         }
         totalToChannel += count;
@@ -606,18 +623,14 @@ void relayDirectTcpip(ssh_channel channel) {
     if (transferred) {
       lastActivityMs = millis();
     } else if (millis() - lastActivityMs > kRelayIdleTimeoutMs) {
-      Serial.println("Relay: idle timeout, closing");
+      closeReason = "idle timeout";
       break;
     }
     delay(1);
   }
 
-  Serial.printf(
-      "Relay: closing (target connected=%d, channel open=%d, channel eof=%d) "
-      "bytes to-target=%u to-channel=%u heap=%u\n",
-      target.connected(), ssh_channel_is_open(channel),
-      ssh_channel_is_eof(channel), totalToTarget, totalToChannel,
-      static_cast<unsigned>(ESP.getFreeHeap()));
+  Serial.printf("Relay: closed (%s), bytes to-PC=%u to-client=%u\n",
+                closeReason, totalToTarget, totalToChannel);
   target.stop();
   ssh_channel_send_eof(channel);
   ssh_channel_close(channel);
@@ -727,6 +740,11 @@ void sshServerTask(void*) {
   }
 
   ssh_bind bind = ssh_bind_new();
+  if (bind == nullptr) {
+    Serial.println("SSH: ssh_bind_new failed");
+    vTaskDelete(nullptr);
+    return;
+  }
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BINDADDR, kBindAddress);
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BINDPORT_STR, kBindPort);
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_HOSTKEY, kHostKeyVfsPath);
@@ -763,6 +781,8 @@ void sshServerTask(void*) {
 }  // namespace
 
 void startRecoverySshServer() {
-  xTaskCreatePinnedToCore(sshServerTask, "recovery-ssh", kSshTaskStack, nullptr,
-                          2, nullptr, 0);
+  if (xTaskCreatePinnedToCore(sshServerTask, "recovery-ssh", kSshTaskStack,
+                              nullptr, 2, nullptr, 0) != pdPASS) {
+    Serial.println("SSH: failed to create server task");
+  }
 }

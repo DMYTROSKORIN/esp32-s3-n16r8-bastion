@@ -66,7 +66,14 @@ void deviceConfigFactoryReset() {
     SPIFFS.remove(kHostKeyFsPath);
     SPIFFS.end();
   }
-  memset(&gDeviceConfig, 0, sizeof(DeviceConfig));
+  // The persistent state above is what matters and is now cleared; the
+  // caller restarts within ~2 s of this call, so gDeviceConfig itself is
+  // deliberately left as-is rather than zeroed here. The VPN and SSH tasks
+  // keep running against it until reboot, and zeroing it out from under
+  // them (they hold raw pointers into gDeviceConfig.wg[]) would risk a
+  // WireGuard handshake or SSH auth momentarily operating on blanked-out
+  // key material for no benefit, since nothing reads gDeviceConfig again
+  // after this function returns.
 }
 
 bool deviceConfigMacLoad(uint8_t mac[6]) {
