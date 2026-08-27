@@ -58,12 +58,10 @@ now (values are illustrative):
 | Secondary | `198.51.100.10:51820` | `profile-2` | `10.66.0.3` |
 
 The VPN server's own sshd port used in the jump-without-a-VPN-client example
-below (`8326`) is a single hardcoded firmware constant (`kVpnServerSshPort`
-in `src/recovery_ssh.cpp`), applied identically regardless of which profile
-is active — it is not read from the `.conf` file (wg-quick has no such
-field) and is not currently configurable per profile through the portal.
-Making it a per-profile portal field is a reasonable follow-up if the two
-VPN servers ever run sshd on different ports (see "Open questions" below).
+below (`8326`) is a per-profile field set in the setup portal alongside each
+profile's `.conf` upload (`vpnServerSshPort` in `WgProfileConfig`), since
+wg-quick's `.conf` format has no such field. It defaults to `22` if left
+blank, and the two profiles can use different ports.
 
 Key topology properties, true for any pair of WireGuard servers with no
 routing between them:
@@ -99,9 +97,10 @@ Without a VPN client (jumping through the VPN server's sshd):
 ssh -J user@203.0.113.10:8326,user@10.66.0.2 user@192.168.1.200
 ```
 
-After a failover to the secondary server, the server and tunnel IP change in
-all commands: `198.51.100.10` and `10.66.0.3` (the jump port stays `8326` —
-see the note above about `kVpnServerSshPort`).
+After a failover to the secondary server, the server, tunnel IP, and jump
+port (if the two profiles were given different ones) all change in all
+commands: `198.51.100.10`, `10.66.0.3`, and the secondary profile's own
+configured SSH port.
 
 Notes on the SSH client:
 
@@ -605,7 +604,4 @@ Lessons from debugging on 2026-08-25/26 — check in this order:
   shutdown;
 - an end-to-end test of the ESP32 actually waking the PC via Magic Packet
   (ARP-based MAC learning has already been verified on a live device — see
-  "Wake-on-Wireless LAN" above);
-- whether `kVpnServerSshPort` (currently one hardcoded firmware constant,
-  see "VPN topology" above) should become a per-profile portal field instead,
-  for setups where the two VPN servers run sshd on different ports.
+  "Wake-on-Wireless LAN" above).

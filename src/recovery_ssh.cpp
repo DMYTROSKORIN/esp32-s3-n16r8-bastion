@@ -35,9 +35,6 @@ constexpr uint32_t kRelayIdleTimeoutMs = 10 * 60 * 1000;
 // room to clear while still catching a genuinely gone client reasonably fast.
 constexpr uint32_t kRelayWriteStallTimeoutMs = 30000;
 constexpr uint8_t kMaxAuthMessages = 16;
-// sshd port of the VPN server itself; only used to render copy-paste help
-// commands for jumping over it without a local VPN client.
-constexpr uint16_t kVpnServerSshPort = 8326;
 
 constexpr char kAnsiReset[] = "\x1b[0m";
 constexpr char kAnsiBold[] = "\x1b[1m";
@@ -268,7 +265,7 @@ void writeDetailedHelp(ssh_channel channel, const String& topic) {
         recoveryVpnActiveProfileName(), recoveryVpnEndpoint(), kAnsiCyan,
         gDeviceConfig.sshUser, tunnelIp.c_str(), gDeviceConfig.sshUser,
         gDeviceConfig.pcIp, kAnsiReset, kAnsiCyan, gDeviceConfig.sshUser,
-        recoveryVpnEndpoint(), kVpnServerSshPort, gDeviceConfig.sshUser,
+        recoveryVpnEndpoint(), recoveryVpnServerSshPort(), gDeviceConfig.sshUser,
         tunnelIp.c_str(), gDeviceConfig.sshUser, gDeviceConfig.pcIp, kAnsiReset,
         gDeviceConfig.pcIp, gDeviceConfig.pcPort);
   } else if (topic == "status") {

@@ -140,6 +140,10 @@ details[open] summary::before{content:"–"}
   <input type="hidden" id="wg1" name="wg1">
   <p class="err" data-for="wg1"></p>
   <p class="hint">Standard wg-quick client .conf — AllowedIPs must include 0.0.0.0/0 (full tunnel)</p>
+  <label for="wg1_ssh_port" style="margin-top:10px">VPN server's SSH port</label>
+  <input id="wg1_ssh_port" name="wg1_ssh_port" inputmode="numeric" value="22">
+  <p class="err" data-for="wg1_ssh_port"></p>
+  <p class="hint">For the "pc ssh" jump-host command when no VPN client is active on your device</p>
   <details id="wg2box">
     <summary>Secondary profile (failover)</summary>
     <label style="margin-top:10px">Secondary profile</label>
@@ -151,6 +155,9 @@ details[open] summary::before{content:"–"}
     </div>
     <input type="hidden" id="wg2" name="wg2">
     <p class="err" data-for="wg2"></p>
+    <label for="wg2_ssh_port" style="margin-top:10px">VPN server's SSH port</label>
+    <input id="wg2_ssh_port" name="wg2_ssh_port" inputmode="numeric" value="22">
+    <p class="err" data-for="wg2_ssh_port"></p>
   </details>
 </section>
 </main>
@@ -294,8 +301,8 @@ async function loadConfig(){
       if(d.pcPort)$("pc_port").value=d.pcPort;
       $("ssh_user").value=d.sshUser||"";
       if(d.sshKeySet)filePickers["ssh_key"].setSaved(`${d.sshKeyType} key`);
-      if(d.wg1Set)filePickers["wg1"].setSaved(d.wg1Endpoint);
-      if(d.wg2Set){filePickers["wg2"].setSaved(d.wg2Endpoint);$("wg2box").open=true;}
+      if(d.wg1Set){filePickers["wg1"].setSaved(d.wg1Endpoint);if(d.wg1SshPort)$("wg1_ssh_port").value=d.wg1SshPort;}
+      if(d.wg2Set){filePickers["wg2"].setSaved(d.wg2Endpoint);$("wg2box").open=true;if(d.wg2SshPort)$("wg2_ssh_port").value=d.wg2SshPort;}
       fillSsidOptions([]);
     }
   }catch(e){}
@@ -326,7 +333,9 @@ $("apply").addEventListener("click",async()=>{
   if(send("ssh_user"))p.set("ssh_user",$("ssh_user").value.trim());
   if(send("ssh_key"))p.set("ssh_key",$("ssh_key").value.trim());
   if(send("wg1"))p.set("wg1",$("wg1").value.trim());
+  if(send("wg1_ssh_port"))p.set("wg1_ssh_port",$("wg1_ssh_port").value.trim());
   if(send("wg2"))p.set("wg2",$("wg2").value.trim());
+  if(send("wg2_ssh_port"))p.set("wg2_ssh_port",$("wg2_ssh_port").value.trim());
   const btn=$("apply");
   const testingWifi=send("ssid")||send("pass");
   btn.disabled=true;

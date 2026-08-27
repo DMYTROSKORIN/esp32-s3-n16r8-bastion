@@ -106,15 +106,17 @@ void handleConfig() {
            "{\"provisioned\":%s,\"ssid\":\"%s\",\"passSet\":%s,"
            "\"pcIp\":\"%s\",\"pcPort\":%u,\"sshUser\":\"%s\","
            "\"sshKeySet\":%s,\"sshKeyType\":\"%s\","
-           "\"wg1Set\":%s,\"wg1Endpoint\":\"%s\","
-           "\"wg2Set\":%s,\"wg2Endpoint\":\"%s\"}",
+           "\"wg1Set\":%s,\"wg1Endpoint\":\"%s\",\"wg1SshPort\":%u,"
+           "\"wg2Set\":%s,\"wg2Endpoint\":\"%s\",\"wg2SshPort\":%u}",
            deviceConfigPresent() ? "true" : "false", ssid,
            gDeviceConfig.wifiPassword[0] != '\0' ? "true" : "false",
            gDeviceConfig.pcIp, gDeviceConfig.pcPort, gDeviceConfig.sshUser,
            gDeviceConfig.sshKeyBase64[0] != '\0' ? "true" : "false",
            gDeviceConfig.sshKeyType,
            gDeviceConfig.wgProfileCount >= 1 ? "true" : "false", wg1,
-           gDeviceConfig.wgProfileCount >= 2 ? "true" : "false", wg2);
+           gDeviceConfig.wg[0].vpnServerSshPort,
+           gDeviceConfig.wgProfileCount >= 2 ? "true" : "false", wg2,
+           gDeviceConfig.wg[1].vpnServerSshPort);
   httpServer.send(200, "application/json", json);
 }
 
@@ -401,19 +403,36 @@ void handleApply() {
   }
 
   const char* const wgFields[kMaxWgProfiles] = {"wg1", "wg2"};
+  const char* const wgPortFields[kMaxWgProfiles] = {"wg1_ssh_port",
+                                                    "wg2_ssh_port"};
   for (uint8_t slot = 0; slot < kMaxWgProfiles; ++slot) {
-    if (!httpServer.hasArg(wgFields[slot])) {
-      continue;
+    // Re-uploading the .conf resets the whole profile struct (including
+    // vpnServerSshPort, which isn't part of the .conf format); remember the
+    // previously saved port so it survives a conf-only edit that doesn't
+    // also resend the port field.
+    const uint16_t previousSshPort = draft.wg[slot].vpnServerSshPort;
+    if (httpServer.hasArg(wgFields[slot])) {
+      const String& conf = httpServer.arg(wgFields[slot]);
+      if (conf.isEmpty()) {
+        memset(&draft.wg[slot], 0, sizeof(WgProfileConfig));
+      } else {
+        char reason[96];
+        if (!parseWireGuardConf(conf.c_str(), draft.wg[slot], reason,
+                                sizeof(reason))) {
+          errors.add(wgFields[slot], reason);
+        } else if (!httpServer.hasArg(wgPortFields[slot])) {
+          draft.wg[slot].vpnServerSshPort = previousSshPort;
+        }
+      }
     }
-    const String& conf = httpServer.arg(wgFields[slot]);
-    if (conf.isEmpty()) {
-      memset(&draft.wg[slot], 0, sizeof(WgProfileConfig));
-      continue;
-    }
-    char reason[96];
-    if (!parseWireGuardConf(conf.c_str(), draft.wg[slot], reason,
-                            sizeof(reason))) {
-      errors.add(wgFields[slot], reason);
+
+    if (httpServer.hasArg(wgPortFields[slot])) {
+      const long port = httpServer.arg(wgPortFields[slot]).toInt();
+      if (port < 1 || port > 65535) {
+        errors.add(wgPortFields[slot], "port must be 1-65535");
+      } else {
+        draft.wg[slot].vpnServerSshPort = static_cast<uint16_t>(port);
+      }
     }
   }
 
@@ -435,6 +454,12 @@ void handleApply() {
   }
   if (draft.wg[1].endpoint[0] != '\0' && draft.wg[0].endpoint[0] == '\0') {
     errors.add("wg1", "add a primary profile before a secondary one");
+  }
+  for (uint8_t slot = 0; slot < kMaxWgProfiles; ++slot) {
+    if (draft.wg[slot].endpoint[0] != '\0' &&
+        draft.wg[slot].vpnServerSshPort == 0) {
+      draft.wg[slot].vpnServerSshPort = 22;
+    }
   }
 
   // A real connection attempt catches a wrong password before it is saved;

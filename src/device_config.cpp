@@ -11,7 +11,10 @@ constexpr char kNamespace[] = "recovery";
 constexpr char kConfigKey[] = "cfg";
 constexpr char kMacKey[] = "pcmac";
 constexpr char kPortalKey[] = "portal";
-constexpr uint16_t kConfigVersion = 1;
+// Bumped because WgProfileConfig grew a field (vpnServerSshPort); the
+// deviceConfigLoad() size check below already forces a reprovision on any
+// layout change, but the version bump keeps that self-documenting.
+constexpr uint16_t kConfigVersion = 2;
 constexpr char kHostKeyFsPath[] = "/ssh_host_ed25519_key";
 }  // namespace
 

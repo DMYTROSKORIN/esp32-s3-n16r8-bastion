@@ -23,6 +23,11 @@ struct WgProfileConfig {
   uint16_t mtu;
   WgRouteConfig routes[kMaxWgRoutes];
   uint8_t routeCount;
+  // sshd port of the VPN server itself (not part of the wg-quick .conf
+  // format - set separately in the portal). Only used to render the
+  // jump-host `pc ssh` command for reaching this profile's server without a
+  // local VPN client.
+  uint16_t vpnServerSshPort;
 };
 
 // Everything the portal provisions lives in this one NVS blob. sshKeyBase64 is

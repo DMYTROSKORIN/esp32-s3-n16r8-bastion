@@ -355,6 +355,13 @@ const char* recoveryVpnEndpoint() {
                                                  : "unknown";
 }
 
+uint16_t recoveryVpnServerSshPort() {
+  const int8_t index = activeProfile;
+  return (index >= 0 && index < profileCount())
+             ? profileAt(index).vpnServerSshPort
+             : 0;
+}
+
 IPAddress recoveryVpnAddress() {
   const int8_t index = activeProfile;
   IPAddress address;

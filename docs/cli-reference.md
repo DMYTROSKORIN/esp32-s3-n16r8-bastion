@@ -174,10 +174,9 @@ Without a VPN client (jump over the VPN server's sshd):
 Only destination 192.168.1.200:22 is permitted.
 ```
 
-The `8326` jump port is a firmware constant (`kVpnServerSshPort`) for
-rendering this example, not something read from the WireGuard profile —
-if a VPN server's sshd actually listens elsewhere, adjust the command by
-hand.
+The `8326` jump port comes from the "VPN server's SSH port" field set for
+this profile in the setup portal (defaults to `22` if left blank) — it is
+not part of the WireGuard `.conf` itself, since wg-quick has no such field.
 
 The ESP32 never stores the Linux account's password or the user's
 private SSH key: ProxyJump performs end-to-end authentication from the
