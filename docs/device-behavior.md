@@ -1,184 +1,193 @@
-# Индикация и поведение устройства
+# LED indication and device behavior
 
-Один встроенный RGB-светодиод показывает всё необходимое для запуска и
-диагностики ESP32-S3 без компьютера и Serial Monitor. Цвет сообщает текущее
-состояние, а рисунок мигания помогает отличить нормальную работу от проблемы.
+A single onboard RGB LED shows everything needed to bring the ESP32-S3 up
+and diagnose it without a computer or a serial monitor. Color reports the
+current state, and the flash pattern distinguishes normal operation from a
+problem.
 
-## Быстрая расшифровка цветов
+## Quick color reference
 
-| Индикация | Статус | Что это означает | Что делать |
+| Indication | State | What it means | What to do |
 |---|---|---|---|
-| 🟡 **Постоянный жёлтый** | `SETUP` | Устройство не настроено (или `BOOT` удержан 5 с) и открыло портал настройки | Подключиться к открытой сети `ESP32_SetUp` и заполнить форму на `192.168.4.1` |
-| 🟠 **Мигание янтарным** | удержание `BOOT` | Кнопка `BOOT` зажата; мигание учащается после 5-секундного порога | Отпустить на 5 с для повторной настройки, держать до 10 с для полного сброса |
-| 🔴 **Быстрое красное, 1,5 с, затем перезагрузка** | подтверждение сброса | `BOOT` удержан 10 с — полный заводской сброс принят | Ничего делать не нужно, устройство перезагрузится само |
-| 🔵 **Плавное синее дыхание** | `CONNECTING` | ESP32 подключается или повторно подключается к сохранённой Wi-Fi-сети | Обычно просто подождать; если синий цвет не меняется долго — проверить роутер или заново настроить сеть |
-| 🟢🟢 **Два зелёных импульса** | `ONLINE`, VPN не поднят | Wi-Fi подключён и доступ в интернет подтверждён, но WireGuard-туннель сейчас не работает | Если VPN настроен и должен быть поднят — проверить `vpn status` по SSH-консоли |
-| 🟢🟢 + 🟣 **Два зелёных + одна фиолетовая** | `ONLINE`, VPN на основном профиле | Всё в порядке: интернет есть, активен **первый (основной)** WireGuard-профиль | Действий не требуется |
-| 🟢🟢 + 🟣🟣 **Два зелёных + две фиолетовые** | `ONLINE`, VPN на резервном профиле | Всё в порядке, но устройство работает через **второй (резервный)** профиль — произошёл failover | Стоит проверить основной VPN-сервер |
-| 🔴 **Частое красное мигание (постоянное)** | `NO_INTERNET` | Соединение с Wi-Fi есть, но проверка доступа в интернет не проходит | Проверить интернет на роутере, DNS, ограничения сети или межсетевой экран |
+| 🟡 **Solid yellow** | `SETUP` | Device is unprovisioned (or `BOOT` was held 5 s) and has opened the setup portal | Connect to the open `ESP32_SetUp` network and fill in the form at `192.168.4.1` |
+| 🟠 **Amber blink** | `BOOT` held | `BOOT` button is held; blinking speeds up once the hold reaches 5 seconds | Release at 5 s to reopen setup, hold to 10 s for a full factory reset |
+| 🔴 **Fast red, 1.5 s, then reboot** | reset confirmed | `BOOT` held 10 s — full factory reset accepted | Nothing to do; the device reboots on its own |
+| 🔵 **Smooth blue breathing** | `CONNECTING` | ESP32 is connecting or reconnecting to the saved Wi-Fi network | Usually just wait; if blue persists for a long time, check the router or reprovision the network |
+| 🟢🟢 **Two green flashes** | `ONLINE`, VPN not up | Wi-Fi is connected and internet access is confirmed, but the WireGuard tunnel is currently not up | If a VPN is configured and expected to be up, check `vpn status` over the SSH console |
+| 🟢🟢 + 🟣 **Two green + one violet** | `ONLINE`, VPN on the primary profile | Everything is fine: internet is up, the **first (primary)** WireGuard profile is active | No action needed |
+| 🟢🟢 + 🟣🟣 **Two green + two violet** | `ONLINE`, VPN on the failover profile | Everything is fine, but the device is running on the **second (failover)** profile — a failover occurred | Worth checking the primary VPN server |
+| 🔴 **Continuous fast red blinking** | `NO_INTERNET` | Wi-Fi is connected, but the internet-reachability check is failing | Check the router's internet connection, DNS, network restrictions, or firewall |
 
-### Как выглядит нормальная работа
+### What normal operation looks like
 
 ```text
-🟢 100 мс → пауза 100 мс → 🟢 100 мс → пауза ~2,3 с → 🟣 150 мс [→ пауза 150 мс → 🟣 150 мс] → пауза → повтор (цикл ~3,6 с)
+🟢 100 ms → pause 100 ms → 🟢 100 ms → pause ~2.3 s → 🟣 150 ms [→ pause 150 ms → 🟣 150 ms] → pause → repeat (~3.6 s cycle)
 ```
 
-Двойной зелёный импульс — сигнал «Wi-Fi и интернет исправны». Число
-фиолетовых импульсов после паузы кодирует состояние VPN: ни одного — туннель
-не поднят, один — работает основной профиль, два — активен резервный
-(произошёл failover). Так по одному взгляду на светодиод видно и что
-устройство онлайн, и какой именно VPN-сервер сейчас используется, без входа
-в SSH-консоль.
+The double green flash signals "Wi-Fi and internet are healthy." The number
+of violet flashes after the pause encodes VPN state: none — the tunnel is
+not up, one — the primary profile is active, two — the failover profile is
+active (a failover occurred). This way a single glance at the LED shows both
+that the device is online and which VPN server it is currently using,
+without opening the SSH console.
 
-Края каждой вспышки (зелёной и фиолетовой) слегка сглажены программно
-(~20 мс нарастание/спад) — это не аппаратная функция светодиода, а расчёт
-промежуточной яркости на каждой итерации главного цикла (он крутится
-каждые ~5 мс). Собственно мигание/паттерн при этом остаётся резким и легко
-считываемым; сглаживание касается только коротких границ вспышек и полного
-плавного дыхания в состоянии `CONNECTING`. Тревожные сигналы (быстрое
-красное мигание, янтарное при удержании `BOOT`, красная вспышка сброса)
-намеренно остаются жёсткими — резкость там часть смысла.
+The edges of every flash (green and violet) are softened slightly in
+software (~20 ms rise/fall) — this isn't a hardware feature of the LED, it's
+an intermediate-brightness calculation on every iteration of the main loop
+(nominally every ~5 ms, though a network state check can occasionally
+stretch one iteration by up to ~1-2 s while a check host is unreachable).
+The blink pattern itself stays crisp and easy to
+read; the smoothing only affects the short flash edges and the full smooth
+breathing in the `CONNECTING` state. Alert signals (fast red blinking, amber
+while `BOOT` is held, the reset flash) deliberately stay hard-edged — the
+sharpness is part of the meaning there.
 
-## Первый запуск
+## First boot
 
-Если устройство ещё не провижено (нет сохранённой конфигурации в NVS), оно
-автоматически переходит в режим настройки:
+If the device hasn't been provisioned yet (no saved configuration in NVS),
+it automatically enters setup mode:
 
-1. Светодиод загорается **постоянным жёлтым**.
-2. ESP32 создаёт открытую Wi-Fi-сеть `ESP32_SetUp` без пароля.
-3. Пользователь подключается к ней с телефона или компьютера — портал
-   рассчитан в первую очередь на настройку с телефона.
-4. Портал настройки обычно открывается автоматически (captive portal). Если
-   этого не произошло, нужно открыть в браузере `http://192.168.4.1`.
-5. Одна страница целиком описывает устройство: Wi-Fi-сеть и пароль, IP и
-   SSH-порт основного ПК, имя пользователя, а также публичный SSH-ключ и
-   один или два профиля WireGuard — **только загрузкой файла** (кнопка
-   «Choose file…» с проверкой на лету), без ручного ввода/вставки текста.
-   Это осознанное решение: на iOS портал открывается в урезанном мини-браузере
-   (Captive Network Assistant), который теряет состояние формы при любом
-   переключении в другое приложение — а именно вставка из буфера требует
-   такого переключения. Загрузка файла обходится системным пикером, который
-   не покидает мини-браузер.
-6. По кнопке **Apply & restart** ESP32 сначала реально пытается подключиться
-   к указанной Wi-Fi-сети (пока точка `ESP32_SetUp` продолжает работать), и
-   только при успехе проверяет остальные поля, атомарно сохраняет конфигурацию
-   в NVS и перезагружается. Неверный пароль или недоступная сеть — это ошибка
-   в поле пароля/сети без сохранения, а не сюрприз после перезагрузки.
-7. После перезагрузки устройство начинает **плавно дышать синим**, пока
-   подключается к выбранной сети.
-8. После подключения и успешной проверки интернета начинается последовательность
-   из **двух зелёных импульсов**.
+1. The LED lights up **solid yellow**.
+2. The ESP32 creates an open Wi-Fi network, `ESP32_SetUp`, with no password.
+3. The user connects to it from a phone or a computer — the portal is
+   designed primarily for setup from a phone.
+4. The setup portal usually opens automatically (captive portal). If it
+   doesn't, open `http://192.168.4.1` in a browser.
+5. A single page covers everything: the Wi-Fi network and password, the main
+   PC's IP and SSH port, the username, and the public SSH key plus one or two
+   WireGuard profiles — **file upload only** (a "Choose file…" button with
+   inline validation), with no manual paste/typing. This is a deliberate
+   choice: on iOS the portal opens inside a stripped-down mini-browser
+   (Captive Network Assistant) that loses all form state on any switch to
+   another app — and pasting from the clipboard requires exactly that kind
+   of switch. File upload works through the system picker, which never
+   leaves the mini-browser.
+6. On **Apply & restart**, the ESP32 first makes a real connection attempt
+   to the given Wi-Fi network (while the `ESP32_SetUp` access point keeps
+   running), and only on success does it validate the remaining fields,
+   atomically save the configuration to NVS, and reboot. A wrong password or
+   an unreachable network is reported as an inline error on the
+   password/network field rather than a surprise after reboot.
+7. After rebooting, the device starts **breathing blue smoothly** while it
+   connects to the chosen network.
+8. Once connected and the internet check succeeds, a sequence of **two green
+   flashes** begins.
 
-Портал не имеет тайм-аута и остаётся доступным, пока настройка не будет
-завершена. ESP32-S3 поддерживает Wi-Fi только в диапазоне 2,4 ГГц. WireGuard
-не обязателен — без него устройство работает в урезанном режиме (SSH по LAN
-есть, VPN и бастион недоступны).
+The portal has no timeout and stays reachable until setup is completed. The
+ESP32-S3 only supports 2.4 GHz Wi-Fi. WireGuard is optional — without it the
+device runs in a reduced mode (LAN SSH works, VPN and the bastion are
+unavailable).
 
-## Повторная настройка или полный сброс
+## Reprovisioning or a full reset
 
-Кнопка `BOOT` имеет два порога удержания:
+The `BOOT` button has two hold thresholds:
 
-1. Включить устройство и дождаться запуска основной прошивки.
-2. Нажать и удерживать `BOOT`. После ~3 секунд светодиод начинает **мигать
-   янтарным** — сигнал, что кнопка распознана.
-   - **Отпустить в промежутке 5–10 секунд:** ESP32 перезагружается и снова
-     открывает портал настройки, уже **предзаполненный текущими значениями**
-     (кроме пароля и секретов — их поля показывают, что значение сохранено, и
-     принимают новое только если его ввести).
-   - **Продолжать удерживать до 10 секунд:** мигание учащается, на отметке
-     10 с светодиод переходит в **быстрое красное** примерно на 1,5 секунды —
-     без необходимости отпускать кнопку — и происходит полный заводской
-     сброс: Wi-Fi, PC, SSH-ключ и имя пользователя, оба WireGuard-профиля и
-     уникальный SSH host key в SPIFFS удаляются безвозвратно.
-3. После сброса устройство перезагружается и открывает пустой портал
-   настройки, как при первом запуске.
+1. Power on the device and wait for the main firmware to start.
+2. Press and hold `BOOT`. After ~3 seconds the LED starts **blinking amber**
+   — a signal that the button press was recognized.
+   - **Release between 5 and 10 seconds:** the ESP32 reboots and reopens the
+     setup portal, already **pre-filled with the current values** (except
+     the password and secrets — their fields show that a value is saved and
+     only accept a new one if you type one in).
+   - **Keep holding to 10 seconds:** blinking speeds up, and at the 10 s
+     mark the LED switches to **fast red** for about 1.5 seconds — with no
+     need to release the button — and a full factory reset happens: Wi-Fi,
+     PC address, SSH key and username, both WireGuard profiles, and the
+     unique SSH host key in SPIFFS are permanently deleted.
+3. After the reset, the device reboots and opens the empty setup portal, as
+   on first boot.
 
-Не следует удерживать `BOOT` во время включения питания или аппаратного сброса:
-в этом случае ESP32 может перейти в системный режим загрузки прошивки.
+Do not hold `BOOT` while powering on or during a hardware reset — the ESP32
+may instead enter the system firmware-download mode.
 
-## Логика состояний
+## State machine
 
 ```text
-Нет сохранённой конфигурации
+No saved configuration
           │
           ▼
    🟡 SETUP / ESP32_SetUp ──► Apply & restart
           │                        │
           │                        ▼
-          │                 перезагрузка
+          │                     reboot
           │                        │
           ▼                        ▼
-   🔵 CONNECTING ◄─────────────── потеря Wi-Fi
-          │                            ▲
-          ├── Wi-Fi + интернет ──► 🟢 ONLINE
-          │                            │
-          └── Wi-Fi без интернета ► 🔴 NO_INTERNET
-                                       │
-                                       └── интернет восстановлен ──► 🟢 ONLINE
+   🔵 CONNECTING ◄─────────────── Wi-Fi lost ─────────────────┐
+          │                            ▲                       │
+          ├── Wi-Fi + internet ──► 🟢 ONLINE                   │
+          │                            │                       │
+          └── Wi-Fi, no internet ► 🔴 NO_INTERNET ─────────────┘
+                                       │         (Wi-Fi lost from here too)
+                                       └── internet restored ──► 🟢 ONLINE
 
-BOOT удержан 3–5 с → 🟠 мигание   │ отпущен в 5–10 с → перезагрузка → 🟡 SETUP (предзаполнено)
-BOOT удержан 10 с   → 🔴 1,5 с    → полный сброс → перезагрузка → 🟡 SETUP (пусто)
+BOOT held 3-5 s → 🟠 blinking   │ released at 5-10 s → reboot → 🟡 SETUP (pre-filled)
+BOOT held 10 s   → 🔴 1.5 s     → factory reset → reboot → 🟡 SETUP (empty)
 ```
 
-## Как определяется доступ в интернет
+## How internet access is detected
 
-Подключение к роутеру ещё не гарантирует наличие интернета, поэтому Wi-Fi и
-интернет отображаются как разные состояния.
+Being connected to the router doesn't yet guarantee internet access, so
+Wi-Fi and internet are shown as separate states.
 
-Каждые 10 секунд прошивка пытается установить TCP-соединение с Google Public
-DNS на порту 53:
+Every 10 seconds the firmware tries to open a TCP connection to Google
+Public DNS on port 53:
 
-- основной сервер: `8.8.8.8`;
-- резервный сервер: `8.8.4.4`.
+- primary server: `8.8.8.8`;
+- fallback server: `8.8.4.4`.
 
-Успешного ответа хотя бы от одного сервера достаточно для состояния `ONLINE`.
-Если оба сервера недоступны, ESP32 переходит в `NO_INTERNET`. После
-восстановления доступа устройство автоматически возвращается в `ONLINE`.
+A successful TCP connection to at least one server is enough for `ONLINE`
+(no DNS query is sent or answered — this is purely a reachability probe). If
+both servers are unreachable, the ESP32 switches to `NO_INTERNET`. Once
+access is restored, the device automatically returns to `ONLINE`.
 
-## Аварийный VPN и SSH-консоль
+## Recovery VPN and SSH console
 
-Параллельно с индикацией работают ещё две подсистемы (подробности в
+Two more subsystems run alongside the LED indication (details in
 [recovery-access-architecture.md](recovery-access-architecture.md)):
 
-- **SSH-сервер** стартует после подключения к Wi-Fi и слушает порт 22 на
-  всех интерфейсах — он доступен из локальной сети и через
-  WireGuard-туннель. Вход только по авторизованному публичному ключу.
-- **WireGuard-задача** после синхронизации времени по NTP поднимает туннель
-  к основному VPN-серверу и держит его маршрутом по умолчанию. Каждые
-  10 секунд выполняется health-check: свежий handshake (≤ 180 с) плюс
-  TCP-проверка `1.1.1.1:53` / `8.8.8.8:53` **через туннель**. После трёх
-  подряд неудач плата автоматически переключается на резервный сервер.
-- В серийный лог (115200 бод) пишутся переходы состояний VPN
+- The **SSH server** starts once connected to Wi-Fi and listens on port 22
+  on all interfaces — it is reachable from the local network and through the
+  WireGuard tunnel. Login is by authorized public key only.
+- The **WireGuard task** brings up a tunnel to the primary VPN server after
+  NTP time sync and holds it as the default route. Every 10 seconds it runs
+  a health check: a recent handshake (≤ 180 s) plus a TCP check against
+  `1.1.1.1:53` / `8.8.8.8:53` **through the tunnel**. After three
+  consecutive failures the board automatically switches to the failover
+  server.
+- The serial log (115200 baud) records VPN state transitions
   (`WireGuard: profile 1 is online`, `health check failed (n/3)`,
-  `failing over to …`) — это первый источник диагностики при проблемах с
-  туннелем.
+  `failing over to …`) — the first place to look when diagnosing tunnel
+  issues.
 
-Обратите внимание: проверка «интернет для LED-индикации» (`8.8.8.8:53`,
-`8.8.4.4:53`) — это отдельный механизм от VPN health-check; после поднятия
-туннеля обе проверки идут уже через WireGuard.
+Note: the "internet for LED indication" check (`8.8.8.8:53`, `8.8.4.4:53`)
+is a separate mechanism from the VPN health check; once the tunnel is up,
+both checks run through WireGuard.
 
-## Хранение настроек и IP-адрес
+## Settings storage and IP address
 
-- Вся конфигурация (Wi-Fi, IP/порт ПК, имя пользователя и публичный SSH-ключ,
-  до двух профилей WireGuard) хранится одним блоком в разделе NVS `recovery`
-  ESP32 — см. `include/device_config.h`.
-- Ничего из этого не находится в исходном коде, настройках PlatformIO или Git.
-- MAC-адрес основного ПК не вводится вручную — он определяется автоматически
-  через ARP при первом появлении ПК в сети и тоже кешируется в NVS.
-- Прошивка получает IP-адрес по DHCP.
-- Постоянный локальный адрес при необходимости закрепляется на роутере через
-  DHCP reservation, а не зашивается в прошивку.
+- The entire configuration (Wi-Fi, PC IP/port, username and public SSH key,
+  up to two WireGuard profiles) is stored as one block in the ESP32's
+  `recovery` NVS namespace — see `include/device_config.h`.
+- None of it lives in the source code, PlatformIO settings, or Git.
+- The main PC's MAC address isn't entered manually — it's learned
+  automatically via ARP the first time the PC appears on the network, and is
+  also cached in NVS.
+- The firmware gets its IP address via DHCP.
+- A stable local address, if needed, is pinned on the router via a DHCP
+  reservation rather than hardcoded into the firmware.
 
-## Быстрая диагностика
+## Quick diagnostics
 
-- **Жёлтый не гаснет:** настройка ещё не завершена. Откройте `ESP32_SetUp` и
-  портал `192.168.4.1`.
-- **Синий мигает долго:** сохранённая сеть недоступна или изменился её пароль.
-  Проверьте роутер либо удерживайте `BOOT` 5 секунд для повторной настройки.
-- **Красный часто мигает (постоянно):** ESP32 видит роутер, но не может выйти
-  в интернет. Проверьте интернет-канал и правила сети для `8.8.8.8:53` и
-  `8.8.4.4:53`.
-- **Двойной зелёный:** устройство работает штатно.
-- **WoWLAN не будит ПК:** консоль покажет `NO MAC` в строке `WoWLAN`, пока ПК
-  ни разу не был увиден в сети после настройки/сброса — включите его вручную
-  один раз, дальше MAC запомнится.
+- **Yellow won't turn off:** setup isn't finished yet. Open `ESP32_SetUp`
+  and the `192.168.4.1` portal.
+- **Blue blinks for a long time:** the saved network is unreachable or its
+  password changed. Check the router, or hold `BOOT` for 5 seconds to
+  reprovision.
+- **Continuous fast red blinking:** the ESP32 sees the router but can't
+  reach the internet. Check the internet uplink and network rules for
+  `8.8.8.8:53` and `8.8.4.4:53`.
+- **Double green:** the device is operating normally.
+- **WoWLAN doesn't wake the PC:** the console shows `NO MAC` on the `WoWLAN`
+  line as long as the PC hasn't been seen on the network yet since
+  setup/reset — power it on manually once, and the MAC will be remembered
+  from then on.

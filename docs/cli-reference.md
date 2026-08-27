@@ -1,32 +1,36 @@
-# Терминальная консоль аварийного доступа
+# Recovery-access terminal console
 
-## Назначение
+## Purpose
 
-SSH-консоль ESP32 должна быть понятной без внешней инструкции. После входа она
-сразу показывает dashboard, а команда `help` объясняет доступные действия и
-приводит готовые примеры. Пользователю не требуется помнить синтаксис.
+The ESP32's SSH console should be usable without any outside instructions.
+On login it immediately shows a dashboard, and the `help` command explains
+the available actions with ready-to-use examples. The user shouldn't have to
+remember any syntax.
 
-Это не Unix shell. Произвольные системные команды, запуск программ и доступ к
-файловой системе не поддерживаются. Консоль содержит только безопасный набор
-операций для диагностики и восстановления связи.
+This is not a Unix shell. Arbitrary system commands, running programs, and
+filesystem access are not supported. The console exposes only a safe set of
+operations for diagnostics and connectivity recovery.
 
-Без доступа к SSH то же самое (Wi-Fi/интернет/VPN-профиль) частично видно по
-встроенному RGB LED — см. таблицу цветов в
-[recovery-access-architecture.md](recovery-access-architecture.md#индикация-состояния-rgb-led)
-или полное описание в [device-behavior.md](device-behavior.md).
+Without SSH access, the same high-level state (Wi-Fi/internet/VPN profile)
+is partly visible on the built-in RGB LED — see the color table in
+[recovery-access-architecture.md](recovery-access-architecture.md#status-indication-rgb-led) or the
+full description in [device-behavior.md](device-behavior.md).
 
-## Начальный экран
+## Landing screen
 
-Реализованный dashboard использует ANSI-цвета: индикатор ● в каждой строке
-(зелёный — работает, жёлтый — переходное состояние, красный — отказ),
-серые второстепенные детали и голубые подсказки команд. Prompt `recovery>`
-выделен жирным зелёным.
+The dashboard uses ANSI colors: a ● indicator on every line — green means
+that specific line is healthy/`ONLINE`, red means Wi-Fi/internet/the main
+PC is unreachable or the VPN has consecutive health-check failures, and
+yellow covers every other WireGuard state (`WAITING`/`CONNECTING`/
+`DEGRADED`/`NOT_CONFIGURED`) as well as `WoWLAN: NO MAC` — plus gray
+secondary details and cyan command hints. The `recovery>` prompt is bold
+green.
 
 ```text
   ESP32 Recovery Gateway
   ────────────────────────────────────────────────
   Device     ● ONLINE    uptime 0d 00:07:44
-  Wi-Fi      ● ONLINE    HomeWiFi-5GHz  -51 dBm
+  Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm
   Internet   ● ONLINE
   WireGuard  ● ONLINE    profile-1  10.66.0.2  handshake 10s ago
   Main PC    ● ONLINE    192.168.1.200  ssh :22 open
@@ -38,23 +42,30 @@ SSH-консоль ESP32 должна быть понятной без внеш�
 recovery>
 ```
 
-Поведение строк:
+Line behavior:
 
-- `WireGuard` показывает фактическое состояние VPN-задачи
-  (`WAITING / CONNECTING / ONLINE / DEGRADED`), активный профиль,
-  tunnel IP и возраст последнего handshake.
-- Строка `VPN errors` появляется только при последовательных неудачах
-  health-check.
-- `WoWLAN` показывает `READY` с MAC-адресом, когда ПК офлайн и его можно
-  будить, `STANDBY`, когда ПК уже онлайн, и `NO MAC`, если MAC ещё не был
-  выучен (ПК ни разу не появлялся в сети после настройки/сброса).
-- `reset:` — причина последней перезагрузки
-  (power-on / software / panic / watchdog / brownout).
+- `WireGuard` shows the VPN task's actual state
+  (`NOT_CONFIGURED / WAITING / CONNECTING / ONLINE / DEGRADED`) and the
+  active profile name. The tunnel IP and handshake age are appended only
+  once a handshake actually exists; before that, only the profile name is
+  shown.
+- A `VPN errors` line appears once `consecutiveFailures > 0` for the
+  active profile — incremented by any failed connection/health-check
+  attempt, not only by health-check failures on an otherwise-established
+  tunnel.
+- `WoWLAN` shows `READY` with the MAC address when the PC is offline and
+  can be woken, `STANDBY` when the PC is already online, and `NO MAC` if
+  the MAC hasn't been learned yet — which requires the PC to have
+  answered a TCP probe on its configured SSH port at least once since
+  provisioning/reset, so the ARP lookup that follows the probe can
+  succeed.
+- `reset:` is the reason for the last reboot (power-on / software / panic
+  / interrupt-watchdog / task-watchdog / watchdog / brownout / other).
 
-## Главная справка
+## Top-level help
 
-Команды `help` и `?` доступны всегда. Фактический вывод `help` в текущей
-прошивке:
+The `help` and `?` commands are always available. The actual `help`
+output in the current firmware:
 
 ```text
 ESP32 Recovery Gateway - command reference
@@ -75,35 +86,43 @@ NETWORK
 VPN
   vpn status             Show tunnel and handshake state
   vpn failover           Switch to the other profile
-  vpn retry-primary      Switch to profile-1
+  vpn retry-primary      Switch to server-1
 
 HELP
   help                   Show this command list
   help <command>         Show details and examples
   help examples          Show common recovery scenarios
+  exit, quit             Close the SSH session
+
+Examples:
+  help pc wake
+  help pc ssh
+  pc status
 ```
 
-Также реализованы `exit`, `quit`, `logout`, редактирование строки
-(Backspace), `Ctrl+C` (сброс введённой строки) и `Ctrl+D` (выход).
+`logout` is also implemented as a synonym for `exit`/`quit`, along with
+line editing (Backspace), `Ctrl+C` (clears the current input line), and
+`Ctrl+D` (exits).
 
-Команды следующих этапов (пока не реализованы): `watch`, `health`,
-`pc ping`, `vpn peers`, `vpn reconnect`, `vpn history`, `wifi status`,
-`internet check`, `logs`, `logs follow`, `reboot`.
+Commands planned for later stages (not yet implemented): `watch`,
+`health`, `pc ping`, `vpn peers`, `vpn reconnect`, `vpn history`,
+`wifi status`, `internet check`, `logs`, `logs follow`, `reboot`.
 
-## Подробная справка
+## Per-command help
 
-`help <command>` обязательно показывает:
+`help <command>` is required to show:
 
-- назначение;
-- полный синтаксис;
-- значения по умолчанию;
-- что команда изменяет;
-- возможные ошибки;
-- один или несколько готовых примеров;
-- связанный следующий шаг.
+- purpose;
+- full syntax;
+- default values;
+- what the command changes;
+- possible errors;
+- one or more ready-to-use examples;
+- the related next step.
 
-Пример `help pc wake` (адрес и MAC подставляются из текущей конфигурации;
-`pc wake` отказывает с понятным сообщением, если MAC ещё не выучен):
+Example `help pc wake` (the address and MAC are substituted from the
+current configuration; `pc wake` fails with a clear message if the MAC
+hasn't been learned yet):
 
 ```text
 pc wake - wake the main PC over Wi-Fi
@@ -119,7 +138,7 @@ Example:
   pc status
 ```
 
-Пока MAC не выучен, команда вместо этого отвечает:
+While the MAC hasn't been learned yet, the command instead replies:
 
 ```text
 The PC's MAC address has not been learned yet.
@@ -127,21 +146,21 @@ It must appear on the network at least once (powered on)
 before WoWLAN can target it.
 ```
 
-`help <command>` реализована подробно только для `pc wake`, `pc ssh`,
-`status` и `examples` (см. выше и ниже). Для любой другой команды, включая
-`vpn failover`, `vpn status`, `net status` и т. д., ответ сейчас —
-универсальная заглушка:
+`help <command>` is currently implemented in detail only for `pc wake`,
+`pc ssh`, `status`, and `examples` (see above and below). For any other
+command, including `vpn failover`, `vpn status`, `net status`, etc., the
+response right now is a generic placeholder:
 
 ```text
 No detailed help for 'vpn failover'. Type 'help' for all commands.
 ```
 
-Расширение подробной справки на остальные команды по реестру команд
-(см. «Требование к реализации» ниже) — не реализовано, план.
+Extending per-command help to the rest of the command registry (see
+"Implementation requirement" below) is not implemented yet — planned.
 
-Фактический вывод `pc ssh` (адреса подставляются динамически из активного
-профиля — после failover команды печатаются уже с адресами резервного
-сервера):
+The actual `pc ssh` output (the addresses are filled in dynamically from
+the active profile — after a failover the commands print with the
+backup server's addresses instead):
 
 ```text
 pc ssh - connect through this ESP32 bastion
@@ -150,98 +169,107 @@ If your device is a VPN client of profile-1 (203.0.113.10):
   ssh -J user@10.66.0.2 user@192.168.1.200
 
 Without a VPN client (jump over the VPN server's sshd):
-  ssh -J user@203.0.113.10:2222,user@10.66.0.2 user@192.168.1.200
+  ssh -J user@203.0.113.10:8326,user@10.66.0.2 user@192.168.1.200
 
 Only destination 192.168.1.200:22 is permitted.
 ```
 
-ESP32 не хранит пароль Linux и приватный SSH-ключ пользователя: ProxyJump
-выполняет сквозную аутентификацию с локальной машины, плата лишь
-пробрасывает TCP-поток. Полноценные интерактивные сессии (включая
-полноэкранные TUI вроде `btop`) через бастион работают.
+The `8326` jump port is a firmware constant (`kVpnServerSshPort`) for
+rendering this example, not something read from the WireGuard profile —
+if a VPN server's sshd actually listens elsewhere, adjust the command by
+hand.
 
-## Готовые сценарии
+The ESP32 never stores the Linux account's password or the user's
+private SSH key: ProxyJump performs end-to-end authentication from the
+local machine, and the board only relays the TCP stream. Full
+interactive sessions (including full-screen TUIs like `btop`) work
+through the bastion.
 
-Команда `help examples` показывает последовательности для типичных аварий.
-Фактический вывод в текущей прошивке — ровно два сценария:
+## Ready-made scenarios
 
-### Основной VPN на ПК не работает
+The `help examples` command shows step sequences for common failures.
+The actual output in the current firmware, in this exact order, is:
 
 ```text
-1. status
-2. pc status
-3. pc ssh
-   Then run the displayed ProxyJump command locally.
+Common recovery scenarios
+
+PC asleep:
+  pc status
+  pc wake
+  pc status
+
+Main VPN failed:
+  status
+  pc status
+  pc ssh
+  Then run the displayed ProxyJump command locally.
 ```
 
-### ПК находится в режиме сна
+Below are two more recovery scenarios, useful as a reference but **not
+part of** the actual `help examples` output:
+
+### The active VPN server is unreachable
 
 ```text
-1. pc status
-2. pc wake
-3. pc status
-```
-
-Ниже — дополнительные сценарии для этого же класса отказов, полезные как
-справочник, но **не входящие** в реальный вывод `help examples`:
-
-### Активный VPN-сервер недоступен
-
-```text
-1. vpn status          (по LAN: ssh user@192.168.1.120, если туннель мёртв)
+1. vpn status          (over LAN: ssh user@192.168.1.120, if the tunnel is dead)
 2. vpn failover
 3. vpn status
-4. Переключить свой VPN-клиент на тот же сервер, что и плата
+4. Point your own VPN client at the same server the board is now on
 ```
 
-### Интернет или Wi-Fi нестабилен
+### Internet or Wi-Fi is flaky
 
 ```text
 1. net status
 2. status
-3. Смотреть серийный лог по USB (115200 бод) — переходы VPN-состояний
+3. Watch the serial log over USB (115200 baud) for VPN state transitions
 ```
 
-## Поведение и безопасность
+## Behavior and security
 
-Реализовано:
+Implemented:
 
-- Разрешена только SSH-аутентификация по public key (один авторизованный
-  ключ, имя пользователя и сам ключ задаются через портал настройки и
-  хранятся в NVS); максимум 16 auth-сообщений на сессию.
-- ESP32 никогда не показывает private key, preshared key или пароль Wi-Fi.
-- SSH bastion разрешает только назначение `<PC IP>:<PC port>` из текущей
-  конфигурации; запрос любого другого `direct-tcpip`-назначения отклоняется.
-- Сервер обслуживает одну сессию за раз. Пока открыт проброшенный туннель к
-  ПК, консоль недоступна (и наоборот).
-- Защита от зависших клиентов: 30 с на key exchange/аутентификацию
-  (плюс TCP keepalive), 60 с от подключения до запуска shell, 10 минут
-  idle-timeout консоли и туннеля — после чего сессия закрывается с
-  сообщением `Idle timeout. Bye.`, и сервер снова принимает подключения.
-- Неизвестная команда не выполняется и отсылает к `help`.
-- `Ctrl+C` сбрасывает набранную строку, `Ctrl+D` завершает сессию.
-- Команды `vpn failover` / `vpn retry-primary` подтверждают приём запроса и
-  предлагают проверить результат через `vpn status`.
+- Only public-key SSH authentication is allowed (a single authorized
+  key; the username and the key itself are set through the setup portal
+  and stored in NVS); at most 16 auth messages per session.
+- The ESP32 never displays the private key, preshared key, or Wi-Fi
+  password.
+- The SSH bastion only permits the `<PC IP>:<PC port>` destination from
+  the current configuration; a request for any other `direct-tcpip`
+  destination is rejected.
+- The server handles one session at a time. While a relayed tunnel to
+  the PC is open, the console is unavailable (and vice versa).
+- Protection against stalled clients: a 30 s libssh I/O timeout on the
+  session (covers a stall during key exchange or authentication) plus
+  TCP keepalive as a backstop for a client that vanishes without a FIN;
+  a 60 s budget *after* authentication succeeds for the client to open a
+  channel and either request a shell or open the PC tunnel; and a
+  10-minute idle timeout for both the console and the tunnel. The
+  interactive shell prints `Idle timeout. Bye.` before closing; an idle
+  tunnel just closes silently (it's a raw relay, not a text channel).
+  Either way the server goes back to accepting connections right after.
+- An unknown command isn't executed and points the user to `help`.
+- `Ctrl+C` clears the current input line, `Ctrl+D` ends the session.
+- `vpn failover` / `vpn retry-primary` acknowledge the request and
+  suggest checking the result with `vpn status`.
 
-Планируется:
+Planned:
 
-- кольцевой журнал всех событий без секретных данных;
-- `reboot` с явным текстовым подтверждением;
-- подсказка похожих команд при опечатке.
+- a ring buffer log of all events, with no secrets in it;
+- `reboot` with an explicit text confirmation;
+- suggesting similar commands on a typo.
 
-## Требование к реализации
+## Implementation requirement (not yet done)
 
-Команды описываются в едином реестре со следующими полями:
+Today, command dispatch (`executeCommand()`) and the help text
+(`writeHelp()` / `writeDetailedHelp()`) in `src/recovery_ssh.cpp` are two
+separate hardcoded `if`/`else` chains — which is exactly why `help
+<command>` above is only implemented for a handful of commands, and why
+this document has to be checked against the source by hand instead of
+being guaranteed correct by construction.
 
-- имя и aliases;
-- краткое описание;
-- подробная справка;
-- синтаксис;
-- примеры;
-- уровень доступа;
-- признак подтверждения;
-- функция-обработчик.
-
-`help` и `help <command>` генерируются непосредственно из этого реестра. Это
-исключает ситуацию, когда прошивка изменилась, а встроенная справка осталась
-устаревшей.
+The intended fix is a single command registry with, per command: name
+and aliases; short description; detailed help; syntax; examples; access
+level; confirmation flag; handler function — with `help` and
+`help <command>` generated directly from it, so the firmware can't drift
+from its own built-in help text again.

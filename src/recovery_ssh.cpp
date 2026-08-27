@@ -563,7 +563,7 @@ void relayDirectTcpip(ssh_channel channel) {
 
   // Blocking mode so ssh_channel_write() below gives real backpressure
   // instead of silently buffering unboundedly (see docs/recovery-access-
-  // architecture.md, "Надёжность", for why). Reads are unaffected: the
+  // architecture.md, "Reliability", for why). Reads are unaffected: the
   // ssh_channel_poll/ssh_channel_read_nonblocking calls further down always
   // force their own non-blocking mode regardless of this flag.
   ssh_channel_set_blocking(channel, 1);

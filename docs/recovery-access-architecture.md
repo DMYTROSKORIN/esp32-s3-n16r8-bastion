@@ -1,153 +1,161 @@
-# Архитектура аварийного доступа
+# Recovery access architecture
 
-## Назначение
+## Purpose
 
-ESP32-S3 работает как независимый аварийный бастион для восстановления доступа
-к основному Linux-ПК, если основной WireGuard-туннель на ПК перестал работать.
+The ESP32-S3 acts as an independent emergency bastion for restoring access to
+the main Linux PC when the PC's own WireGuard tunnel stops working.
 
-Целевой сценарий:
+Target scenario:
 
 ```text
-Удалённый ноутбук/телефон
+Remote laptop/phone
           │
-          │ WireGuard через один из двух VPN-серверов
+          │ WireGuard through one of two VPN servers
           ▼
       ESP32-S3
           │
-          │ локальная сеть 192.168.1.0/24
+          │ local network 192.168.1.0/24
           ▼
-Linux-ПК 192.168.1.200:22
+Linux PC 192.168.1.200:22
           │
-          └── диагностика и перезапуск основного WireGuard-туннеля
+          └── diagnose and restart the main WireGuard tunnel
 ```
 
-## Индикация состояния (RGB LED)
+## Status indication (RGB LED)
 
-Помимо SSH-консоли, устройство сообщает своё состояние одним встроенным RGB
-LED — это единственная диагностика, доступная без компьютера. Полное описание
-с точными таймингами — в [device-behavior.md](device-behavior.md); здесь —
-сводка для быстрой ориентации:
+Besides the SSH console, the device reports its state through a single
+built-in RGB LED — the only diagnostic available without a computer. The full
+description with exact timings is in
+[device-behavior.md](device-behavior.md); here is a quick-reference summary:
 
-| Индикация | Состояние |
+| Indication | State |
 |---|---|
-| 🟡 Постоянный жёлтый | Портал настройки открыт (`ESP32_SetUp`) |
-| 🟠 Мигание янтарным | Кнопка `BOOT` удерживается |
-| 🔴 Быстрое красное, 1,5 с | Подтверждён полный заводской сброс |
-| 🔵 Плавное синее дыхание | Подключение к Wi-Fi |
-| 🟢🟢 без фиолетового | Wi-Fi и интернет есть, VPN-туннель не поднят |
-| 🟢🟢 + 🟣 одна вспышка | VPN поднят на **основном** профиле (`profile-1`) |
-| 🟢🟢 + 🟣🟣 две вспышки | VPN поднят на **резервном** профиле (`profile-2`) — произошёл failover |
-| 🔴 Частое красное (постоянно) | Wi-Fi есть, интернета нет |
+| 🟡 Solid yellow | Setup portal is open (`ESP32_SetUp`) |
+| 🟠 Amber blink | `BOOT` button is being held |
+| 🔴 Fast red, 1.5 s | Full factory reset confirmed |
+| 🔵 Smooth blue breathing | Connecting to Wi-Fi |
+| 🟢🟢 two green flashes, no violet flash | Wi-Fi and internet are up, VPN tunnel is not |
+| 🟢🟢 + 🟣 one flash | VPN up on the **primary** profile (`profile-1`) |
+| 🟢🟢 + 🟣🟣 two flashes | VPN up on the **secondary** profile (`profile-2`) — a failover happened |
+| 🔴 Fast red (steady) | Wi-Fi is up, internet is not |
 
-Число фиолетовых вспышек после зелёной пары равно номеру активного
-WireGuard-профиля — так по одному взгляду на светодиод видно, поднят ли VPN
-и не произошёл ли уже failover, без входа в SSH-консоль.
+The number of violet flashes after the green pair equals the number of the
+active WireGuard profile — so a single glance at the LED shows whether the
+VPN is up and whether a failover has already happened, without opening the
+SSH console.
 
-## Топология VPN (пример текущего провижининга этого устройства)
+## VPN topology (example of this device's current provisioning)
 
-Оба профиля загружаются через портал настройки (см. «Провижининг через
-портал настройки» ниже) — плата не привязана к конкретным серверам на уровне
-прошивки, слот 1 и слот 2 могут указывать на любой WireGuard-сервер
-пользователя. Ниже — пример того, как сейчас провижено это конкретное
-устройство (значения условные):
+Both profiles are loaded through the setup portal (see "Provisioning through
+the setup portal" below) — the firmware is not tied to specific servers;
+slot 1 and slot 2 can point at any WireGuard server the user owns. Below is
+an example of how this particular device happens to be provisioned right
+now (values are illustrative):
 
-| Роль | Endpoint | sshd | Профиль платы | Tunnel IP платы |
-|---|---|---|---|---|
-| Основной | `203.0.113.10:51820` | `2222` | `profile-1` | `10.66.0.2` |
-| Резервный | `198.51.100.10:51820` | `2222` | `profile-2` | `10.66.0.3` |
+| Role | Endpoint | Board profile | Board tunnel IP |
+|---|---|---|---|
+| Primary | `203.0.113.10:51820` | `profile-1` | `10.66.0.2` |
+| Secondary | `198.51.100.10:51820` | `profile-2` | `10.66.0.3` |
 
-Ключевые свойства топологии, актуальные для любой пары WireGuard-серверов без
-маршрутизации между собой:
+The VPN server's own sshd port used in the jump-without-a-VPN-client example
+below (`8326`) is a single hardcoded firmware constant (`kVpnServerSshPort`
+in `src/recovery_ssh.cpp`), applied identically regardless of which profile
+is active — it is not read from the `.conf` file (wg-quick has no such
+field) and is not currently configurable per profile through the portal.
+Making it a per-profile portal field is a reasonable follow-up if the two
+VPN servers ever run sshd on different ports (see "Open questions" below).
 
-- **Маршрутизации между VPN-серверами нет.** Плата видна только на том
-  сервере, к которому подключена прямо сейчас. Клиент (ноутбук/телефон)
-  обязан подключаться к тому же серверу, иначе tunnel IP платы недостижим —
-  это выглядит как «VPN поднялся, но соединения нет», хотя оба туннеля
-  исправны.
-- **Tunnel IP платы меняется при failover** (в примере выше — `10.66.0.2` на
-  основном, `10.66.0.3` на резервном; реальные значения зависят от
-  загруженных `.conf`). Команда консоли `pc ssh` всегда печатает готовые
-  команды с актуальным адресом.
-- Профилем 1 (основным) стоит делать тот сервер, к которому по умолчанию
-  подключаются клиентские устройства пользователя.
-- Оба сервера должны иметь `ip_forward=1`, nft-цепочку forward с
-  `iifname wg0 accept` + MSS clamp и masquerade для трафика из `wg0` —
-  иначе исходящий интернет-трафик платы через туннель работать не будет.
+Key topology properties, true for any pair of WireGuard servers with no
+routing between them:
 
-### Команды подключения
+- **There is no routing between the VPN servers.** The board is only
+  reachable on whichever server it's currently connected to. The client
+  (laptop/phone) must connect to the same server, or the board's tunnel IP
+  is unreachable — this looks like "the VPN came up but there's no
+  connection" even though both tunnels are healthy.
+- **The board's tunnel IP changes on failover** (in the example above,
+  `10.66.0.2` on the primary, `10.66.0.3` on the secondary; actual values
+  depend on the loaded `.conf` files). The console's `pc ssh` command always
+  prints ready-to-use commands with the current address.
+- Profile 1 (primary) should be whichever server the user's client devices
+  connect to by default.
+- Both servers need `ip_forward=1`, an nftables forward chain with
+  `iifname wg0 accept` plus MSS clamping, and masquerade for traffic from
+  `wg0` — otherwise the board's outbound internet traffic through the tunnel
+  won't work.
 
-С устройства, подключённого VPN-клиентом к основному серверу:
+### Connection commands
+
+From a device connected as a VPN client to the primary server:
 
 ```bash
-ssh user@10.66.0.2                          # консоль платы
-ssh -J user@10.66.0.2 user@192.168.1.200   # сразу на основной ПК
+ssh user@10.66.0.2                          # board console
+ssh -J user@10.66.0.2 user@192.168.1.200   # straight to the main PC
 ```
 
-Без VPN-клиента (jump через sshd VPN-сервера):
+Without a VPN client (jumping through the VPN server's sshd):
 
 ```bash
-ssh -J user@203.0.113.10:2222,user@10.66.0.2 user@192.168.1.200
+ssh -J user@203.0.113.10:8326,user@10.66.0.2 user@192.168.1.200
 ```
 
-После failover на резервный сервер во всех командах меняется сервер и
-tunnel IP: `198.51.100.10` и `10.66.0.3`.
+After a failover to the secondary server, the server and tunnel IP change in
+all commands: `198.51.100.10` and `10.66.0.3` (the jump port stays `8326` —
+see the note above about `kVpnServerSshPort`).
 
-Замечания по SSH-клиенту:
+Notes on the SSH client:
 
-- При первом подключении клиент спросит host key дважды: сначала ключ
-  VPN-сервера (jump host), затем ключ платы. Ключ платы уникален,
-  генерируется при первом старте и хранится в SPIFFS — он не меняется при
-  перепрошивке.
-- OpenSSH 10+ выводит предупреждение про отсутствие post-quantum key
-  exchange: LibSSH-ESP32 его пока не поддерживает. Риск минимален — SSH-трафик
-  уже идёт внутри WireGuard с `PresharedKey`, который даёт постквантовую
-  защиту туннеля. Убрать предупреждение можно в `~/.ssh/config`:
+- On first connection the client asks about the host key twice: first the
+  VPN server's key (the jump host), then the board's key. The board's key is
+  unique, generated on first boot, and stored in SPIFFS — it survives
+  reflashing.
+- OpenSSH 10+ prints a warning about the missing post-quantum key exchange:
+  LibSSH-ESP32 doesn't support it yet. The risk is minimal — the SSH traffic
+  already runs inside WireGuard with a `PresharedKey`, which gives the
+  tunnel itself post-quantum protection. The warning can be silenced in
+  `~/.ssh/config`:
 
   ```
   Host 10.66.0.2 10.66.0.3 192.168.1.120
       WarnWeakCrypto no-pq-kex
   ```
 
-ESP32 не должна предоставлять произвольный доступ ко всей локальной сети. Она
-разрешает только заранее определённые аварийные действия и TCP-туннель к
-настроенному через портал адресу ПК (сейчас `192.168.1.200:22`).
+The ESP32 must not grant arbitrary access to the whole local network. It only
+allows a fixed set of emergency actions and a TCP tunnel to the PC address
+configured through the portal (currently `192.168.1.200:22`).
 
-## Проверенное окружение
+## Verified environment
 
-| Параметр | Значение |
+| Parameter | Value |
 |---|---|
-| Основной ПК | Linux |
-| IP основного ПК | `192.168.1.200/24` |
-| Аварийный сервис | SSH, TCP `22` |
-| Подключение ПК | Wi-Fi, интерфейс `wlan0` |
-| Wi-Fi-адаптер ПК | a Wi-Fi adapter, драйвер `the driver` |
-| Wake-on-Wireless | Настроен и активен: Magic Packet, GTK rekey |
-| Профиль NetworkManager | `HomeWiFi-5GHz` |
-| PCI wakeup | `enabled` |
-| MAC для пробуждения | `AA:BB:CC:DD:EE:FF` |
-| Broadcast локальной сети | `192.168.1.255` |
-| Основной VPN | WireGuard |
-| VPN-серверы | Два, active/passive failover |
+| Main PC | Linux |
+| Main PC IP | `192.168.1.200/24` (example; set through the portal) |
+| Emergency service | SSH, TCP `22` |
+| PC connectivity | Wi-Fi (WoWLAN needs an adapter and driver that support Magic Packet) |
+| MAC for wake-up | learned automatically via ARP, never entered manually |
+| Local network broadcast | `192.168.1.255` (example; taken from the current Wi-Fi subnet) |
+| Primary VPN | WireGuard |
+| VPN servers | Two, active/passive failover |
 
-IP ESP32 назначается по DHCP. Постоянный адрес закрепляется на роутере.
+The ESP32's IP is assigned by DHCP. A stable address is pinned on the router.
 
-## SSH-бастион и терминальный интерфейс
+## SSH bastion and terminal interface
 
-SSH-сервер запускается после подключения к Wi-Fi и слушает `0.0.0.0:22` —
-он доступен и из локальной сети (`192.168.1.120`), и через WireGuard-туннель
-по tunnel IP платы. Разрешена только аутентификация по публичному SSH-ключу
-настроенного через портал пользователя (сейчас `user`); парольная
-аутентификация отключена.
+The SSH server starts once Wi-Fi is connected and listens on `0.0.0.0:22` —
+it is reachable both from the local network (`192.168.1.120`) and through the
+WireGuard tunnel at the board's tunnel IP. Only public-key authentication for
+the user configured through the portal is allowed (currently `user`);
+password authentication is disabled.
 
-Сразу после входа пользователь видит сводный экран (реализован с
-ANSI-цветами: зелёный/жёлтый/красный индикатор ● на строку, серые
-второстепенные детали, голубые подсказки команд):
+Right after login the user sees a summary screen (implemented with ANSI
+colors: a green/yellow/red ● indicator per line, gray secondary details,
+cyan command hints):
 
 ```text
   ESP32 Recovery Gateway
   ────────────────────────────────────────────────
   Device     ● ONLINE    uptime 0d 00:07:44
-  Wi-Fi      ● ONLINE    HomeWiFi-5GHz  -51 dBm
+  Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm
   Internet   ● ONLINE
   WireGuard  ● ONLINE    profile-1  10.66.0.2  handshake 10s ago
   Main PC    ● ONLINE    192.168.1.200  ssh :22 open
@@ -157,324 +165,447 @@ ANSI-цветами: зелёный/жёлтый/красный индикато
   help commands   pc ssh how to reach the PC   pc wake wake it up
 ```
 
-Строка `VPN errors` появляется только при последовательных неудачах
-health-check. `WoWLAN` показывает `READY`, когда основной ПК офлайн и его
-можно будить, и `STANDBY`, когда ПК уже онлайн.
+The `VPN errors` line only appears after consecutive health-check failures.
+`WoWLAN` shows `READY` when the main PC is offline and can be woken, and
+`STANDBY` once the PC is already online.
 
-### Устойчивость SSH-сервера
+### SSH server robustness
 
-Сервер обслуживает одну сессию за раз, поэтому каждая блокирующая операция
-ограничена по времени — иначе один брошенный клиент (зависший на вопросе о
-host key, пропавший из сети телефон, порт-сканер) навсегда блокировал бы
-аварийную консоль до перезагрузки платы. Именно этот отказ был найден и
-исправлен 2026-08-25.
+The server handles one session at a time, so every blocking operation is
+bounded — otherwise a single abandoned client (stuck on a host-key prompt, a
+phone that dropped off the network, a port scanner) would permanently block
+the emergency console until the board was power-cycled. That exact failure
+was found and fixed on 2026-08-25.
 
-Реализованные ограничения (`src/recovery_ssh.cpp`):
+Implemented limits (`src/recovery_ssh.cpp`):
 
-| Механизм | Значение | От чего защищает |
+| Mechanism | Value | Protects against |
 |---|---|---|
-| `SSH_OPTIONS_TIMEOUT` на сессию | 30 с | клиент открыл TCP, но молчит во время key exchange / auth |
-| TCP keepalive на сокете | idle 30 с, интервал 5 с, 4 пробы | клиент исчез без FIN (мобильная сеть, обрыв туннеля) |
-| Дедлайн от accept до запуска shell/relay | 60 с | «капельная» подача данных, растягивающая пред-сессионную фазу |
-| Лимит auth-сообщений | 16 | бесконечный перебор аутентификации |
-| Idle-timeout интерактивной консоли | 10 мин | забытая открытая сессия |
-| Idle-timeout TCP-туннеля к ПК | 10 мин без трафика | подвисший проброшенный канал |
+| `SSH_OPTIONS_TIMEOUT` per session | 30 s | client opened the TCP connection but stays silent during key exchange / auth |
+| TCP keepalive on the socket | 30 s idle, 5 s interval, 4 probes | client vanished without a FIN (mobile network, dropped tunnel) |
+| Deadline from accept to shell/relay start | 60 s | data trickling in, stretching out the pre-session phase |
+| Auth message limit | 16 | endless authentication brute-forcing |
+| Interactive console idle timeout | 10 min | a session left open and forgotten |
+| PC TCP tunnel idle timeout | 10 min with no traffic | a stuck forwarded channel |
 
-После любой ошибки или таймаута сервер гарантированно возвращается в
-`accept` и принимает следующую сессию.
+After any error or timeout the server is guaranteed to go back to `accept`
+and take the next session.
 
-Команды:
+Commands:
 
-| Команда | Назначение | Статус |
+| Command | Purpose | Status |
 |---|---|---|
-| `status` | Однократная сводка состояния | реализована |
-| `uptime` | Время работы устройства | реализована |
-| `version` | Версия прошивки и fingerprint авторизованного ключа | реализована |
-| `pc status` | Проверка доступности `192.168.1.200:22` | реализована |
-| `pc ssh` | Показать готовые ProxyJump-команды с актуальными адресами | реализована |
-| `pc wake` | Отправить Magic Packet основному ПК | реализована |
-| `net status` | Wi-Fi, SSID, IP, RSSI, интернет | реализована |
-| `vpn status` | Активный профиль, tunnel IP, handshake и ошибки | реализована |
-| `vpn failover` | Вручную перейти на другой VPN-профиль | реализована |
-| `vpn retry-primary` | Принудительно вернуться на `profile-1` | реализована |
-| `help`, `help <command>` | Справка из реестра команд | реализована |
-| `exit`, `quit`, `logout` | Закрыть сессию | реализована |
-| `watch` | Обновляемый терминальный dashboard | план |
-| `pc ping` | ICMP-проверка `192.168.1.200` | план |
-| `logs` | Последние события из кольцевого журнала | план |
-| `reboot` | Перезагрузить ESP32 после подтверждения | план |
+| `status` | One-shot state summary | implemented |
+| `uptime` | Device uptime | implemented |
+| `version` | Firmware version and authorized key fingerprint | implemented |
+| `pc status` | Check whether `192.168.1.200:22` is reachable | implemented |
+| `pc ssh` | Print ready-to-use ProxyJump commands with current addresses | implemented |
+| `pc wake` | Send a Magic Packet to the main PC | implemented |
+| `net status` | Wi-Fi, SSID, IP, RSSI, internet | implemented |
+| `vpn status` | Active profile, tunnel IP, handshake, and errors | implemented |
+| `vpn failover` | Manually switch to the other VPN profile | implemented |
+| `vpn retry-primary` | Force a return to `profile-1` | implemented |
+| `help`, `help <command>` | Help generated from the command registry | implemented |
+| `exit`, `quit`, `logout` | Close the session | implemented |
+| `watch` | Auto-refreshing terminal dashboard | planned |
+| `pc ping` | ICMP check of `192.168.1.200` | planned |
+| `logs` | Recent events from the ring buffer log | planned |
+| `reboot` | Reboot the ESP32 after confirmation | planned |
 
-TCP-туннель к ПК реализован как стандартный SSH `direct-tcpip` channel:
-плата работает как jump host (`ssh -J`), при этом разрешено единственное
-назначение `192.168.1.200:22`. Запрос любого другого назначения отклоняется.
+The TCP tunnel to the PC is implemented as a standard SSH `direct-tcpip`
+channel: the board acts as a jump host (`ssh -J`), and only a single
+destination is allowed, `192.168.1.200:22`. A request for any other
+destination is rejected.
 
-`help` является частью интерфейса, а не только документации. Полная структура,
-подробная справка и конкретные примеры команд описаны в
-[cli-reference.md](cli-reference.md). Реализация должна строить справку из того
-же реестра команд, который вызывает обработчики, чтобы текст не расходился с
-фактическими возможностями прошивки.
+`help` is part of the interface, not just documentation. The full structure,
+detailed help text, and concrete command examples are documented in
+[cli-reference.md](cli-reference.md). The implementation builds the help text
+from the same command registry that dispatches the handlers, so the text
+cannot drift from what the firmware actually does.
 
-Для обычного SSH к Linux-ПК предпочтителен стандартный SSH `direct-tcpip`
-channel. Он позволяет использовать ESP32 как jump host, не создавая общий
-SOCKS-прокси и не включая маршрутизацию всей подсети.
+A standard SSH `direct-tcpip` channel is the preferred way to reach the Linux
+PC over plain SSH. It lets the ESP32 act as a jump host without standing up a
+general SOCKS proxy or routing the whole subnet.
 
 ## Wake-on-Wireless LAN
 
-ESP32 может самостоятельно отправить Magic Packet в локальную сеть; отдельный
-сервер для отправки не требуется. Однако пробуждение с Wi-Fi зависит от
-адаптера, драйвера, BIOS/UEFI и режима питания Linux-ПК.
+The ESP32 can send a Magic Packet onto the local network by itself; no
+separate sending server is needed. Waking a PC over Wi-Fi, however, depends
+on the PC's adapter, driver, BIOS/UEFI, and power state.
 
-На текущем ПК WoWLAN настроен и активен в профиле `HomeWiFi-5GHz`. Адаптер
-a Wi-Fi adapter с драйвером `the driver` поддерживает Magic Packet, PCI wakeup
-включён. MAC-адрес в портале не запрашивается — ESP32 определяет его сама
-через ARP-таблицу lwIP при первом TCP-пробе ПК после его появления в сети
-(`src/main_pc.cpp`) и кеширует в NVS; пакет отправляется на broadcast-адрес
-текущей Wi-Fi-подсети (сейчас `192.168.1.255` для MAC `AA:BB:CC:DD:EE:FF`).
-Пока MAC не выучен, `pc wake` отвечает `NO MAC` / понятным сообщением вместо
-попытки разбудить неизвестный адрес.
+WoWLAN depends on Magic Packet support in the specific Wi-Fi adapter and on
+PCI/USB wakeup being enabled in the BIOS/UEFI and in the network profile —
+this needs to be set up on the PC itself once, before the first `pc wake`.
+The MAC address is never requested in the portal — the ESP32 determines it
+itself from the lwIP ARP table the first time it TCP-probes the PC after it
+appears on the network (`src/main_pc.cpp`), and caches it in NVS; the packet
+is sent to the broadcast address of the current Wi-Fi subnet. Until the MAC
+is learned, `pc wake` replies with `NO MAC` / a clear message instead of
+trying to wake an unknown address.
 
-Эталонная ручная проверка из другого устройства этой локальной сети:
+A reference manual check of the same Magic Packet from another device on the
+same local network (to compare against what `pc wake` actually sends):
 
 ```bash
 wakeonlan -i 192.168.1.255 AA:BB:CC:DD:EE:FF
 ```
 
-Перед проверкой основной ПК переводится в сон:
+Put the main PC to sleep first (e.g. `systemctl suspend`). ARP-based MAC
+learning has been verified on a live device; the ESP32 actually sending the
+Magic Packet and the PC actually waking from `s2idle` have not yet been
+verified end to end. The supported target sleep state is `s2idle`; after a
+full shutdown (not sleep) WoWLAN usually doesn't work — that's a limitation
+of the adapter/OS, not the firmware.
 
-```bash
-systemctl suspend
-```
+If the PC doesn't wake after `pc wake`, check in this order: the Magic
+Packet actually reaches the adapter (`tcpdump -i <iface> udp port 9` on the
+PC itself, from another session), WoWLAN is enabled in the adapter settings
+and in the BIOS/UEFI, the network profile in NetworkManager/systemd-networkd
+allows wakeup, and the PC is actually in `s2idle` rather than fully powered
+off.
 
-Фактический тест ещё не выполнен, чтобы не прерывать рабочий сеанс.
-Поддерживаемый целевой режим — пробуждение из `s2idle`; после полного выключения
-WoWLAN обычно не работает.
+If a particular Wi-Fi adapter or BIOS doesn't support the needed power mode,
+a fallback is wiring the ESP32 through an optocoupler/relay in parallel with
+the PC's power button.
 
-В журнале драйвера присутствует предупреждение UBSAN, связанное с `the driver`.
-Сейчас оно не мешает Wi-Fi, но должно проверяться первым, если Magic Packet не
-разбудит компьютер или соединение после resume не восстановится.
+## Two WireGuard profiles
 
-Если конкретный Wi-Fi-адаптер или BIOS не поддерживает нужный режим питания,
-резервным вариантом будет подключение ESP32 через опторазвязку/реле параллельно
-к кнопке питания ПК.
+The ESP32 supports up to two independent profiles loaded through the setup
+portal: `profile-1` (primary, required for the VPN to work) and `profile-2`
+(secondary, optional). Neither server is tied to the firmware — they're just
+two slots the user loads their own `.conf` files into (see the example of
+this device's actual provisioning in "VPN topology" above).
 
-## Два WireGuard-профиля
+Implemented active/passive algorithm (`src/recovery_vpn.cpp`):
 
-ESP32 поддерживает до двух независимых профилей, загружаемых через портал
-настройки: `profile-1` (основной, обязателен для работы VPN) и `profile-2`
-(резервный, опционален). Ни один сервер не привязан к прошивке — это просто
-два слота, в которые пользователь загружает свои `.conf`-файлы (см. пример
-конкретного провижининга в разделе «Топология VPN» выше).
+1. The VPN task waits for Wi-Fi, then syncs the clock over NTP
+   (`pool.ntp.org`, `time.cloudflare.com`) — a WireGuard handshake cannot be
+   verified without correct time.
+2. Once loaded, the board brings up the tunnel via `profile-1` and makes it
+   the default route (`esp_wireguard_set_default`).
+3. The health check runs every **10 s** and requires all of:
+   - a confirmed peer (`esp_wireguard_peer_is_up`);
+   - the last handshake age **≤ 180 s**;
+   - a successful TCP connect through the tunnel to `1.1.1.1:53` or
+     `8.8.8.8:53` (1.2 s timeout).
+4. A **30 s** grace period applies right after a profile starts: failed
+   checks don't count yet (the handshake is still being established).
+5. A single missed check doesn't trigger a switch; a profile is considered
+   unavailable only after **3 consecutive** failures.
+6. The board tears down the current interface and brings up the other
+   profile. It stays there — it does not switch back on its own — as long as
+   that profile keeps working.
+7. `vpn failover` and `vpn retry-primary` switch the profile manually.
+8. On Wi-Fi loss the tunnel is torn down and the state returns to `WAITING`;
+   the cycle restarts once the network is back.
 
-Реализованный алгоритм active/passive (`src/recovery_vpn.cpp`):
+Task states: `WAITING → CONNECTING → ONLINE ⇄ DEGRADED`.
 
-1. VPN-задача ждёт Wi-Fi, затем синхронизирует часы по NTP
-   (`pool.ntp.org`, `time.cloudflare.com`) — без корректного времени
-   WireGuard-handshake невозможно верифицировать.
-2. После загрузки плата устанавливает туннель через `profile-1` и делает
-   его маршрутом по умолчанию (`esp_wireguard_set_default`).
-3. Health-check выполняется каждые **10 с** и требует одновременно:
-   - подтверждённый пир (`esp_wireguard_peer_is_up`);
-   - возраст последнего handshake **≤ 180 с**;
-   - успешный TCP-connect через туннель к `1.1.1.1:53` или `8.8.8.8:53`
-     (таймаут 1,2 с).
-4. Первые **30 с** после запуска профиля действует grace-период: неудачные
-   проверки не засчитываются (handshake ещё устанавливается).
-5. Одна потерянная проверка не вызывает переключения; профиль считается
-   недоступным после **3 последовательных** неудач.
-6. Плата закрывает текущий интерфейс и активирует другой профиль. Пока он
-   работает — остаётся на нём и не возвращается самопроизвольно.
-7. Команды `vpn failover` и `vpn retry-primary` переключают профиль вручную.
-8. При потере Wi-Fi туннель закрывается и состояние возвращается в
-   `WAITING`; после восстановления сети цикл начинается заново.
+Only one WireGuard profile is ever active at a time. Profiles are allowed to
+differ in endpoint, tunnel IP, private key, peer public key, and preshared
+key — the current profiles genuinely do differ in all of these, including
+the tunnel IP.
 
-Состояния задачи: `WAITING → CONNECTING → ONLINE ⇄ DEGRADED`.
+## Provisioning through the setup portal
 
-Одновременно активен только один WireGuard-профиль. Для профилей допускаются
-разные endpoint, tunnel IP, private key, peer public key и preshared key —
-у текущих профилей всё это действительно разное, включая tunnel IP.
+Profiles are imported at runtime, not at build time. The single-page
+`ESP32_SetUp` portal (`portal/index.html`, gzip-embedded into the firmware by
+`scripts/embed_portal.py`) collects Wi-Fi, the PC's IP/port, the username and
+public SSH key, and one or two WireGuard profiles.
 
-## Провижининг через портал настройки
+The public SSH key and both WireGuard profiles are accepted **only as file
+uploads** — there is no paste-in text field at all. Reason: on iOS the
+portal opens inside Apple's Captive Network Assistant (CNA), a restricted
+system mini-browser that loses all form state the moment you leave it for
+another app. Pasting text from elsewhere requires exactly that kind of app
+switch, while the native file picker does not — it opens as a modal sheet on
+top of CNA and doesn't count as "leaving." Every file is validated on the
+spot right after it's picked (key type/length, presence of
+`[Interface]`/`[Peer]` and an endpoint in a WireGuard config), without
+waiting for form submission. The secondary profile has a "Remove" button;
+so does the primary one (added because there was otherwise no way to fully
+replace both sides when switching VPN servers), and clicking it cascades to
+clear the secondary too, since a config with a secondary but no primary
+profile is invalid.
 
-Профили импортируются во время эксплуатации, а не на этапе сборки. Единая
-страница портала `ESP32_SetUp` (`portal/index.html`, встраивается gzip'ом в
-прошивку скриптом `scripts/embed_portal.py`) собирает Wi-Fi, IP/порт ПК, имя
-пользователя и публичный SSH-ключ, а также один или два профиля WireGuard.
+The Wi-Fi password field and the other text fields (PC IP, port, username)
+remain ordinary keyboard input — typing text doesn't leave the CNA app and
+so doesn't break anything.
 
-Публичный SSH-ключ и оба WireGuard-профиля принимаются **только загрузкой
-файла** — текстового поля для вставки в форме нет вообще. Причина: на iOS
-портал открывается внутри Captive Network Assistant (CNA) — урезанного
-системного мини-браузера, который теряет всё состояние формы при переходе в
-другое приложение. Именно вставка текста из буфера требует такого перехода
-(скопировать значение из другого приложения), а системный пикер файлов —
-нет, он открывается модальным листом поверх CNA и не считается «выходом».
-Каждый файл проверяется на лету сразу после выбора (тип/длина ключа,
-наличие `[Interface]`/`[Peer]` и endpoint у WireGuard-конфига) без ожидания
-отправки формы. У secondary-профиля есть кнопка «Remove»; у primary — тоже
-(добавлена, так как без неё нельзя было полностью заменить обе стороны при
-смене VPN-серверов), и её нажатие каскадно очищает secondary, поскольку
-конфигурация без первичного профиля, но со вторым — невалидна.
-
-Поле пароля Wi-Fi и остальные текстовые поля (IP ПК, порт, имя пользователя)
-остаются обычным вводом с клавиатуры — набор текста без выхода из приложения
-CNA не ломает.
-
-Парсер `src/wg_conf.cpp` разбирает и валидирует стандартный wg-quick `.conf`
-прямо на устройстве (перенесён из бывшего Python-скрипта
-`generate_wireguard_config.py`, который больше не существует). Поддерживаемые
-поля те же, что были у build-time валидатора:
+The `src/wg_conf.cpp` parser parses and validates a standard wg-quick `.conf`
+right on the device (ported over from a former Python script,
+`generate_wireguard_config.py`, which no longer exists). The supported
+fields match what the old build-time validator accepted:
 
 ```ini
 [Interface]
-PrivateKey = ...        # base64, ровно 32 байта — проверяется
-Address = ...           # ровно один IPv4-адрес (IPv6 игнорируется)
-MTU = 1300              # опционально; 576–1420, по умолчанию 1420
-DNS = ...               # допускается, но платой не используется
+PrivateKey = ...        # base64, exactly 32 bytes — checked
+Address = ...           # exactly one IPv4 address (IPv6 is ignored)
+MTU = 1300              # optional; 576-1420, defaults to 1420
+DNS = ...               # accepted, but unused by the board
 
 [Peer]
-PublicKey = ...         # base64, 32 байта — проверяется
-PresharedKey = ...      # опционально; base64, 32 байта
-Endpoint = host:port    # только IPv4/hostname
-AllowedIPs = ...        # минимум один IPv4-маршрут; IPv6 игнорируется
+PublicKey = ...         # base64, 32 bytes — checked
+PresharedKey = ...      # optional; base64, 32 bytes
+Endpoint = host:port    # IPv4/hostname only, host limited to alnum/./-
+AllowedIPs = ...        # must include 0.0.0.0/0; IPv6 is ignored
 PersistentKeepalive = ...
 ```
 
-Особенность MTU: библиотека `esp_wireguard` жёстко зашивает MTU 1420,
-поэтому значение из `.conf` применяется прошивкой напрямую к `netif->mtu`
-сразу после установления туннеля.
+A note on MTU: the `esp_wireguard` library hard-codes an MTU of 1420, so the
+firmware applies the value from the `.conf` directly to `netif->mtu` right
+after the tunnel comes up.
 
-Вся конфигурация — Wi-Fi, IP/порт ПК, имя пользователя, SSH-ключ, оба
-WireGuard-профиля — хранится одним блоком `DeviceConfig` в разделе NVS
-`recovery` (`include/device_config.h`, `src/device_config.cpp`).
-`POST /api/apply` валидирует все присланные поля, при любой ошибке отвечает
-`400` с построчными сообщениями и ничего не сохраняет. Если менялись Wi-Fi
-SSID/пароль и остальные поля прошли дешёвую проверку, перед сохранением
-выполняется реальная попытка STA-подключения (`WiFi.begin`, до 15 с) — точка
-`ESP32_SetUp` при этом продолжает работать, ESP32 держит AP и STA
-одновременно. Неверный пароль (`WL_CONNECT_FAILED`) или сеть не найдена
-(`WL_NO_SSID_AVAIL`, включая случай 5 ГГц-only сети) возвращаются как ошибка
-конкретного поля без сохранения — так неправильный пароль не может попасть в
-NVS и обнаружиться только после перезагрузки в мёртвую сеть. При успехе —
-атомарно записывает блок целиком (`Preferences::putBytes`) и планирует
-перезагрузку через 1,5 с. MAC-адрес ПК в форме не запрашивается — его
-определяет и кеширует `src/main_pc.cpp` через ARP-таблицу lwIP, когда ПК
-впервые виден в сети.
+**`AllowedIPs` must include `0.0.0.0/0`** (a full tunnel) — this isn't a
+WireGuard format restriction, it's a requirement of this specific firmware:
+the health check (see "Two WireGuard profiles" above) verifies the tunnel by
+making a TCP connection to `1.1.1.1:53`/`8.8.8.8:53` **through the WireGuard
+interface**. A narrower split-tunnel profile that doesn't cover those
+addresses will technically come up and even complete the handshake, but the
+health check will consider it permanently unreachable and the device will
+flap between profiles forever. That's why `parseWireGuardConf()` rejects any
+profile without an explicit `0.0.0.0/0` at the point it's saved through the
+portal, with a clear error, instead of silently accepting a config that
+won't work. The tradeoff: an equivalent full-tunnel expressed as the pair
+`0.0.0.0/1, 128.0.0.0/1`, or a split-tunnel that explicitly includes both
+health-check addresses, are also rejected — a deliberate simplification in
+favor of one clear rule.
 
-### Безопасность визарда: осознанный компромисс
+The entire configuration — Wi-Fi, PC IP/port, username, SSH key, both
+WireGuard profiles — is stored as a single `DeviceConfig` block in the
+`recovery` NVS namespace (`include/device_config.h`,
+`src/device_config.cpp`). `POST /api/apply` validates every submitted field,
+returns `400` with per-field messages on any error, and saves nothing in
+that case. If the Wi-Fi SSID/password changed and every other field passed
+its cheap validation, a real STA connection attempt is made before saving
+(`WiFi.begin`, up to 15 s) — the `ESP32_SetUp` access point keeps running
+throughout, since the ESP32 holds AP and STA mode simultaneously. A wrong
+password (`WL_CONNECT_FAILED`) or a network that can't be found
+(`WL_NO_SSID_AVAIL`, including a 5 GHz-only network) is returned as a
+field-specific error without saving — so a bad password can never land in
+NVS and only be discovered after a reboot into a dead network. On success,
+the whole block is written atomically (`Preferences::putBytes`) and a reboot
+is scheduled 1.5 s later. The PC's MAC address is never requested in the
+form — `src/main_pc.cpp` determines and caches it via the lwIP ARP table the
+first time the PC is seen on the network.
 
-Портал работает по обычному HTTP на открытой Wi-Fi-сети `ESP32_SetUp` без
-пароля. Это значит, что WireGuard private key, SSH public key, пароль
-домашней Wi-Fi-сети и IP основного ПК передаются **в открытом виде** и
-теоретически доступны любому устройству в радиусе действия точки доступа в
-момент настройки.
+### Wizard security: a deliberate tradeoff
 
-Изначально в этом документе рассматривался двухэтапный provisioning (Wi-Fi —
-через открытую точку, секреты — только через USB или после физического
-подтверждения кнопкой `BOOT`) именно чтобы избежать этого риска. От него
-сознательно отказались в пользу однопроходного веб-портала: удобство настройки
-с телефона (п. 10 требований — 90% случаев) оказалось приоритетнее. Смягчающие
-факторы:
+The portal runs over plain HTTP on the open, passwordless `ESP32_SetUp`
+Wi-Fi network. That means the WireGuard private key, the SSH public key, the
+home Wi-Fi password, and the main PC's IP are transmitted **in the clear**
+and are theoretically visible to any device within range of the access
+point during setup.
 
-- окно риска ограничено временем самой настройки, обычно десятки секунд —
-  дольше открытая сеть не нужна;
-- атака требует физического присутствия в радиусе Wi-Fi именно в момент
-  заполнения формы;
-- после `Apply & restart` устройство закрывает точку доступа и private keys
-  из формы больше никогда не передаются по эфиру.
+An earlier design considered here was a two-stage provisioning flow (Wi-Fi
+over the open AP, secrets only over USB or after a physical confirmation via
+the `BOOT` button) specifically to avoid this risk. It was deliberately
+dropped in favor of a single-pass web portal: the convenience of setting up
+from a phone (requirement #10 — the common case) outweighed it. Mitigating
+factors:
 
-Если этот риск неприемлем для конкретного развёртывания, безопасная
-альтернатива — задать пароль на AP (`WiFi.softAP(kApName, password)` в
-`src/setup_portal.cpp`) или физически провижинить устройство в помещении,
-где посторонние Wi-Fi-клиенты исключены. На данный момент это не сделано.
+- the risk window is limited to the setup itself, typically tens of
+  seconds — the open network isn't needed any longer than that;
+- the attack requires physical presence within Wi-Fi range exactly while
+  the form is being filled in;
+- after `Apply & restart` the device shuts the access point down, and the
+  private keys from the form are never transmitted over the air again.
 
-## Надёжность
+If this risk is unacceptable for a given deployment, a safer alternative is
+to set a password on the AP (`WiFi.softAP(kApName, password)` in
+`src/setup_portal.cpp`) or to provision the device physically in a space
+where stray Wi-Fi clients are excluded. Neither has been done as of now.
 
-Реализовано:
+## Reliability
 
-- независимые FreeRTOS-задачи Wi-Fi/LED, internet health, WireGuard и SSH;
-- контролируемый failover между двумя VPN-профилями (3 неудачных
-  health-check, grace 30 с после запуска профиля);
-- `PersistentKeepalive = 15` для работы за NAT;
-- восстановление туннеля после обрыва Wi-Fi и смены внешнего IP;
-- SSH-сервер защищён от зависания брошенными сессиями (таблица таймаутов
-  выше) — один мёртвый клиент больше не блокирует аварийную консоль;
-- TCP-relay бастиона корректно обрабатывает частичную запись при полном
-  SSH-окне или TCP-буфере;
-- канал в `relayDirectTcpip` работает в **блокирующем** режиме именно для
-  записи (`ssh_channel_set_blocking(channel, 1)`) — более ранняя
-  неблокирующая версия давала форку libssh молча копить исходящие пакеты в
-  постоянно растущий `session->out_buffer` вместо того, чтобы уважать
-  реальную скорость сети; под тяжёлым потоком (`btop`, частые полноэкранные
-  ANSI/truecolor-перерисовки) это рано или поздно роняло сессию с
-  `ssh_socket_write: Out of memory` при очередном `realloc`, тогда как
-  `htop` никогда не генерировал достаточно данных, чтобы это поймать.
-  Найдено и исправлено 2026-08-27 (см. таймаут `SSH_OPTIONS_TIMEOUT` = 30 с
-  выше — он же ограничивает теперь и худший случай блокирующей записи).
-  Чтение (`ssh_channel_poll`/`ssh_channel_read_nonblocking`) не затронуто —
-  обе функции форсируют собственный неблокирующий режим независимо от этого
-  флага;
-- MTU из профиля применяется к туннелю.
+Implemented:
 
-Планируется:
+- independent FreeRTOS tasks for Wi-Fi/LED, internet health, WireGuard, and
+  SSH;
+- controlled failover between the two VPN profiles (3 failed health checks,
+  a 30 s grace period after a profile starts);
+- `PersistentKeepalive = 15` to survive NAT;
+- tunnel recovery after a Wi-Fi drop and an external IP change;
+- the SSH server is protected against hanging on abandoned sessions (the
+  timeout table above) — one dead client no longer blocks the emergency
+  console;
+- the bastion's TCP relay correctly handles a partial write when the SSH
+  window or the TCP buffer is full;
+- the channel in `relayDirectTcpip` runs in **blocking** mode specifically
+  for writes (`ssh_channel_set_blocking(channel, 1)`) — the earlier
+  non-blocking version let this libssh fork silently buffer outgoing data
+  into an ever-growing `session->out_buffer` instead of respecting the
+  network's real throughput; under a heavy stream (`btop`, frequent
+  full-screen ANSI/truecolor redraws) this would eventually crash the
+  session with `ssh_socket_write: Out of memory` on some `realloc`, whereas
+  `htop` never generated enough data to trigger it. Found and fixed on
+  2026-08-27 (see the `SSH_OPTIONS_TIMEOUT` = 30 s entry above — it now also
+  bounds the worst case for a blocking write). Reads
+  (`ssh_channel_poll`/`ssh_channel_read_nonblocking`) are unaffected — both
+  functions force their own non-blocking mode regardless of this flag;
+- on EOF from the SSH client, the relay doesn't tear down both sides at
+  once: it does `shutdown(fd, SHUT_WR)` on the socket to the PC (a proper
+  TCP half-close) and keeps pulling the PC's response until the PC closes
+  its side or the connection times out on idle — previously a response sent
+  after the request's EOF was lost;
+- `ssh_channel_write()` in the interactive console (dashboard, prompt,
+  character echo) goes through the same reliable, retrying
+  `writeAllToChannel()` as the relay, rather than a bare call with no
+  result check;
+- WireGuard's `esp_wireguard_connect()` in `startProfile()` is bounded by a
+  20 s deadline — previously an endpoint with a hostname that never
+  resolved (a DNS outage, a typo) could keep the VPN task looping on
+  `ESP_ERR_RETRY` forever, with no failover and no response to
+  `vpn failover`/`vpn retry-primary`;
+- `deviceConfigFactoryReset()` no longer zeroes `gDeviceConfig` in memory —
+  the persistent state (NVS/SPIFFS) is already correctly wiped by that
+  point, and zeroing the struct while the VPN/SSH tasks on other cores still
+  hold raw pointers into it was a race with no upside (the board reboots
+  ~2 s later regardless);
+- the portal checks the SSH key's structural integrity
+  (`isWellFormedSshWireFields`) and performs a real trial import via
+  `ssh_pki_import_pubkey_base64()` — the same function the SSH server calls
+  after reboot — before saving it; previously a structurally similar but
+  corrupted/truncated key could pass the portal and permanently disable SSH
+  after reboot with no self-recovery;
+- `ensureHostKey()` actually attempts to load the existing host key
+  (`ssh_pki_import_privkey_file`) instead of trusting the mere fact that the
+  file exists — an empty/corrupted file used to make `ssh_bind_listen()`
+  fail with no regeneration;
+- `ssh_bind_new()` and both `xTaskCreatePinnedToCore` calls (SSH and VPN)
+  are checked for failure and logged;
+- `vpn failover`/`vpn retry-primary` requests go through a single
+  `std::atomic<VpnRequest>` with `exchange()` instead of two independent
+  `volatile bool`s: this is a single-slot mailbox where the last command
+  wins — `exchange()` removes the race between reading and clearing the
+  request, so an intervening command can't be dropped silently, though this
+  is not a guarantee that every individually issued command runs;
+- `consecutiveFailures` (the count of consecutive VPN health-check
+  failures) saturates at its maximum instead of wrapping to 0 after ~42
+  minutes of continuous failure — previously the dashboard could show a
+  false "recovered";
+- the profile's MTU is applied to the tunnel.
 
-- аппаратный watchdog и учёт причины каждой перезагрузки в журнале;
-- кольцевой журнал без секретных данных;
-- A/B OTA, проверка новой версии и автоматический rollback;
-- последняя рабочая конфигурация сохраняется до проверки новой;
-- brownout detection и стабильное независимое питание;
-- в production: Secure Boot V2, Flash Encryption и подписанные обновления.
+### Known accepted risks (not fixed, rationale)
 
-## Этапы реализации
+- `esp_wireguard`/`wireguardif` (a third-party library) calls raw lwIP APIs
+  (`netif_add/remove/set_default`, the raw UDP API, direct edits to
+  `netif->mtu`) from a user FreeRTOS task on core 1, rather than from
+  `tcpip_thread` and not under the core lock (`CONFIG_LWIP_TCPIP_CORE_LOCKING`
+  is disabled in the SDK in use) — this formally violates lwIP's threading
+  model. Across extensive active testing (dozens of
+  reconnects/failovers/reboots) it has never manifested, but rare races on
+  the `netif` list/UDP PCBs are theoretically possible right at the moment
+  of a failover or Wi-Fi loss under concurrent SSH traffic. A proper fix
+  would mean wrapping every library call through `tcpip_callback` — an
+  invasive rewrite of third-party code that hasn't been undertaken;
+- a narrow race in the ARP lookup (`main_pc.cpp`): after draining a stale
+  semaphore token, there remains a theoretical chance that a callback from
+  an already-timed-out previous call is still sitting in the
+  `tcpip_callback` queue and fires while the next request is being prepared
+  — strictly speaking, it could also land in the gap between clearing
+  `found` and writing the new IP into `ArpQuery`. There's no guarantee that
+  a "late" callback reads an already-current IP; the practical safety
+  margin comes from somewhere else: `ArpQuery` is a single reused static
+  object, not a per-call one, and in normal operation it repeatedly queries
+  the same, unchanging configured PC IP. So the worst practical effect is
+  one extra redundant ARP scan, not a result swapped for someone else's MAC.
+  A complete fix would need per-call lifetime management (heap allocation
+  plus a generation id, or a `shared_ptr`), which was judged a
+  disproportionate amount of complexity for this narrow, non-corrupting
+  case.
 
-1. ~~SSH-сервер в локальной сети, public-key authentication и dashboard~~ — готово.
-2. Проверки `192.168.1.200:22` и команда `pc ssh` — готово; кольцевой журнал — план.
-3. Испытание уже настроенного WoWLAN из `s2idle`; команда `pc wake` реализована,
-   фактический тест пробуждения ещё не проводился.
-4. ~~Один WireGuard-профиль и удалённый SSH-доступ только к ESP32~~ — готово
-   (SSH доступен и из LAN, решение оставить это — см. открытые вопросы).
-5. ~~TCP bastion до `192.168.1.200:22` через WireGuard~~ — готово, протестировано
-   полной цепочкой и нагрузкой.
-6. ~~Второй профиль, автоматический failover и ручные команды управления~~ — готово.
-7. ~~Провижининг Wi-Fi, ПК, SSH-ключа и WireGuard-профилей через веб-портал на
-   работающем устройстве~~ — готово (см. «Провижининг через портал
-   настройки» выше). Транзакционный rollback (вернуть предыдущий рабочий
-   набор профилей при неудачной проверке нового) — план.
-8. A/B OTA, watchdog fault injection и длительное soak-тестирование.
-9. Production hardening: Secure Boot, Flash Encryption, уникальные ключи,
-   пароль на `ESP32_SetUp` или иная защита провижининга от прослушивания
-   эфира (см. «Безопасность визарда» выше).
+Planned:
 
-## Диагностика типовых отказов
+- a hardware watchdog and a logged reason for every reboot;
+- a ring-buffer log with no secrets in it;
+- A/B OTA, new-version verification, and automatic rollback;
+- keeping the last known-good configuration until a new one is verified;
+- brownout detection and a stable, independent power supply;
+- for production: Secure Boot V2, Flash Encryption, and signed updates.
 
-Выводы из отладки 2026-08-25/26 — проверять в этом порядке:
+## Implementation stages
 
-1. **«VPN поднялся, но плату не видно».** Убедиться, что клиент подключён к
-   тому же VPN-серверу, на котором сейчас плата (`vpn status` в консоли по
-   LAN, либо `wg show` на сервере: пир платы должен иметь свежий
-   handshake). Помнить, что tunnel IP платы различается на серверах.
-2. **TCP:22 открывается, но SSH-баннер не приходит.** До фикса это означало
-   зависший однопоточный сервер (лечилось только перезагрузкой платы);
-   после фикса сервер сам сбрасывает мёртвые сессии за 30–60 с. Если
-   повторяется — снять серийный лог.
-3. **Сессию выкидывает под нагрузкой (например, `btop`, но не `htop`).**
-   Два независимых фикса: (а) потеря байтов при частичной записи в relay —
-   исправлено, проверять контрольной суммой:
-   `ssh -J … user@192.168.1.200 'seq 1 200000' | md5sum`; (б) сама сессия
-   обрывалась с `ssh_socket_write: Out of memory` из-за неблокирующей
-   записи в канал — исправлено 2026-08-27 (см. «Надёжность» выше). Если всё
-   же повторится — серийный лог покажет точный текст ошибки libssh и байты,
-   переданные в каждую сторону.
-4. **Handshake на сервере отсутствует вовсе.** Проверить соответствие
-   публичного ключа платы пиру на сервере
-   (`echo <privkey> | wg pubkey`) и PSK.
+1. ~~SSH server on the local network, public-key authentication, and a
+   dashboard~~ — done.
+2. `192.168.1.200:22` checks and the `pc ssh` command — done; a ring-buffer
+   log — planned.
+3. Exercising the already-configured WoWLAN from `s2idle`; the `pc wake`
+   command is implemented, the actual wake-up test hasn't been run yet.
+4. ~~A single WireGuard profile and remote SSH access to the ESP32 only~~ —
+   done (SSH is also reachable from the LAN; keeping it that way is a
+   decision — see "Open decisions").
+5. ~~A TCP bastion to `192.168.1.200:22` over WireGuard~~ — done, tested
+   through the full chain and under load.
+6. ~~A second profile, automatic failover, and manual control commands~~ —
+   done.
+7. ~~Provisioning Wi-Fi, the PC, the SSH key, and WireGuard profiles through
+   a web portal on the running device~~ — done (see "Provisioning through
+   the setup portal" above). Transactional rollback (restoring the previous
+   working set of profiles if the new one fails verification) — planned.
+8. A/B OTA, watchdog fault injection, and extended soak testing.
+9. Production hardening: Secure Boot, Flash Encryption, unique keys, a
+   password on `ESP32_SetUp` or some other protection for provisioning
+   against eavesdropping (see "Wizard security" above).
 
-## Открытые решения
+## Diagnosing common failures
 
-- способ защиты `ESP32_SetUp` от прослушивания эфира во время провижининга
-  (сейчас открытая сеть без пароля — принятый компромисс, см. «Безопасность
-  визарда» выше);
-- транзакционный rollback: вернуть предыдущий рабочий набор WireGuard-
-  профилей, если новый не проходит проверку после применения;
-- оставить ли ESP32 SSH доступным из LAN или только через WireGuard;
-- способ аппаратного включения ПК, если WoWLAN не работает после полного
-  выключения;
-- результат фактического теста WoWLAN и влияние предупреждения UBSAN `the driver`.
+Lessons from debugging on 2026-08-25/26 — check in this order:
+
+1. **"The VPN came up, but the board isn't reachable."** Make sure the
+   client is connected to the same VPN server the board is currently on
+   (`vpn status` in the console over LAN, or `wg show` on the server: the
+   board's peer should have a recent handshake). Remember that the board's
+   tunnel IP differs between servers.
+2. **TCP:22 opens, but the SSH banner never arrives.** Before the fix this
+   meant the single-threaded server had wedged (fixable only by rebooting
+   the board); after the fix the server reclaims dead sessions on its own
+   within 30-60 s. If it recurs, capture the serial log.
+3. **A session gets dropped under load (e.g. `btop`, but not `htop`).** Two
+   independent fixes: (a) bytes lost on a partial write in the relay —
+   fixed, verify with a checksum:
+   `ssh -J … user@192.168.1.200 'seq 1 200000' | md5sum`; (b) the session
+   itself would crash with `ssh_socket_write: Out of memory` because of a
+   non-blocking channel write — fixed on 2026-08-27 (see "Reliability"
+   above). If it recurs, the serial log will show the exact libssh error
+   text and the bytes transferred in each direction.
+4. **No handshake at all on the server.** Check that the board's public key
+   matches its peer entry on the server (`echo <privkey> | wg pubkey`) and
+   the PSK.
+5. **VPN stays in `CONNECTING` for a long time, `vpn failover`/
+   `vpn retry-primary` execute with a delay.** Before the fix on
+   2026-08-27, an endpoint with a hostname that never resolved could keep
+   `esp_wireguard_connect()` looping on `ESP_ERR_RETRY` with no time limit
+   at all. Each individual connection attempt is now bounded to 20 s, but
+   after a failed attempt the task waits 10 s and tries again — so the
+   overall `CONNECTING` state can last longer than a single attempt. A
+   manual command is stored atomically and processed between attempts,
+   meaning it takes effect within roughly 30 s rather than instantly. If the
+   serial log shows a recurring `connect timed out`, check the DNS for the
+   profile's `Endpoint` hostname.
+6. **SSH is unreachable after portal setup, even though the portal reported
+   success.** Before the fix, a structurally similar but
+   corrupted/truncated SSH key could pass the portal's validation and
+   permanently break the SSH server after reboot, with no self-recovery.
+   The portal now performs a real trial import using the same function the
+   server uses, so such a key should now be rejected right in the form. If
+   it recurs, the serial log will show `SSH: initialization failed`;
+   recovery is to hold `BOOT` for 5 s and upload a correct key again.
+
+## Open decisions
+
+- how to protect `ESP32_SetUp` against eavesdropping during provisioning
+  (currently an open network with no password — an accepted tradeoff, see
+  "Wizard security" above);
+- transactional rollback: restoring the previous working set of WireGuard
+  profiles if a newly applied one fails verification;
+- whether to keep ESP32 SSH reachable from the LAN or restrict it to
+  WireGuard only;
+- a hardware way to power the PC on if WoWLAN doesn't work after a full
+  shutdown;
+- an end-to-end test of the ESP32 actually waking the PC via Magic Packet
+  (ARP-based MAC learning has already been verified on a live device — see
+  "Wake-on-Wireless LAN" above);
+- whether `kVpnServerSshPort` (currently one hardcoded firmware constant,
+  see "VPN topology" above) should become a per-profile portal field instead,
+  for setups where the two VPN servers run sshd on different ports.
