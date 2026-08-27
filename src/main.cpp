@@ -20,6 +20,12 @@ constexpr uint32_t kEditModeHoldMs = 5000;
 constexpr uint32_t kFactoryResetHoldMs = 10000;
 constexpr uint32_t kFactoryResetFlashMs = 1500;
 constexpr uint32_t kHoldFeedbackStartMs = 3000;
+// Mechanical contact bounce on a press or release can re-trigger a CHANGE
+// interrupt several times within a couple of milliseconds; a 30 ms deadband
+// between accepted edges is comfortably longer than any bounce train this
+// class of button produces and comfortably shorter than a human's fastest
+// deliberate press or release, so it can't be mistaken for one.
+constexpr uint32_t kBootDebounceMs = 30;
 
 constexpr uint32_t kReconnectIntervalMs = 10000;
 constexpr uint32_t kInternetCheckIntervalMs = 10000;
@@ -57,17 +63,24 @@ volatile bool bootButtonPressed = false;
 volatile uint32_t bootPressStartMs = 0;
 volatile uint32_t bootReleaseMs = 0;
 volatile bool bootReleasePending = false;
+volatile uint32_t lastBootEdgeMs = 0;
 
 void IRAM_ATTR bootButtonIsr() {
   const uint32_t now = millis();
   portENTER_CRITICAL_ISR(&bootButtonMux);
-  if (digitalRead(kBootButtonPin) == LOW) {
-    bootButtonPressed = true;
-    bootPressStartMs = now;
-  } else {
-    bootButtonPressed = false;
-    bootReleaseMs = now;
-    bootReleasePending = true;
+  // Debounce: an edge within kBootDebounceMs of the last *accepted* one is
+  // bounce, not a real press/release - drop it instead of letting it
+  // overwrite bootPressStartMs/bootReleaseMs with a bogus timestamp.
+  if (now - lastBootEdgeMs >= kBootDebounceMs) {
+    lastBootEdgeMs = now;
+    if (digitalRead(kBootButtonPin) == LOW) {
+      bootButtonPressed = true;
+      bootPressStartMs = now;
+    } else {
+      bootButtonPressed = false;
+      bootReleaseMs = now;
+      bootReleasePending = true;
+    }
   }
   portEXIT_CRITICAL_ISR(&bootButtonMux);
 }
