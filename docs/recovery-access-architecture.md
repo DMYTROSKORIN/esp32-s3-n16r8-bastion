@@ -415,6 +415,39 @@ to set a password on the AP (`WiFi.softAP(kApName, password)` in
 `src/setup_portal.cpp`) or to provision the device physically in a space
 where stray Wi-Fi clients are excluded. Neither has been done as of now.
 
+### Secrets at rest: no NVS/Flash encryption, deliberately
+
+The Wi-Fi password, both WireGuard private/preshared keys, and the SSH host
+key are stored unencrypted — the Wi-Fi password and WireGuard keys in the
+NVS blob (`src/device_config.cpp`), the SSH host key as a plain file on
+SPIFFS (`src/recovery_ssh.cpp`). Anyone with the board in hand and a
+`esptool.py read_flash` can pull all of it straight out of SPI flash.
+
+ESP32-S3 has real answers to this — NVS Encryption and Flash Encryption V2,
+both backed by keys burned into eFuse — and they were deliberately not
+enabled here:
+
+- Flash Encryption is **one-way**: once the relevant eFuses are burned, the
+  chip can never be un-encrypted, and re-flashing afterward requires either
+  the original encryption key or accepting that a wrong image bricks the
+  device. That's a permanent, high-consequence trade against this project's
+  "just reflash it" workflow (including [handing a flash off to an AI
+  agent](agent-flashing.md), which has no way to handle an encryption key
+  even if one existed).
+- The threat this defends against is physical possession of the board by
+  someone who wants its keys — not remote compromise. This device is meant
+  to live in one specific, physically secure location (the same place the
+  main PC already sits), where an attacker walking off with it is excluded
+  from the threat model already assumed for that location. Encrypting
+  secrets against a threat that isn't in scope buys nothing but a
+  permanent, irreversible complication to the build/flash/reprovision
+  workflow.
+
+If a future deployment puts the board somewhere physical access by an
+untrusted party is actually plausible, that changes the calculus and this
+section should be revisited — Flash Encryption V2 plus NVS Encryption would
+be the right tool then, accepted one-way cost and all.
+
 ## Reliability
 
 Implemented:
