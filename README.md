@@ -62,6 +62,11 @@ Open the directory in VS Code with the PlatformIO extension, then use the Platfo
 action (or `pio run -t upload` / `pio run -t upload -t monitor`). The serial monitor runs at
 115200 baud; PlatformIO auto-detects the upload port.
 
+Handing this off to an AI coding agent (Claude Code, Codex CLI, etc.) instead? Point it at
+[docs/agent-flashing.md](docs/agent-flashing.md) — it covers finding the port, building, flashing,
+and reading back the boot log without an interactive terminal, and is explicit about the one thing
+it can't do for you: the setup portal wizard needs a human on Wi-Fi.
+
 The firmware is fully provisioned at runtime — nothing is baked into the build. On first boot (or
 after a factory reset) it opens an open access point, `ESP32_SetUp`, with a lightweight captive
 setup page covering Wi-Fi, the main PC's address, SSH access, and up to two WireGuard profiles.
@@ -170,7 +175,7 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 | Framework | Arduino core for ESP32, built with PlatformIO |
 | SSH server | [LibSSH-ESP32](https://github.com/ewpa/LibSSH-ESP32) (Arduino port of libssh) |
 | WireGuard client | [esphome-libs/wireguard](https://github.com/esphome-libs/wireguard) (`esp_wireguard`/`wireguardif`) |
-| Docs | [Recovery architecture](docs/recovery-access-architecture.md) · [Device behavior & LED](docs/device-behavior.md) · [CLI reference](docs/cli-reference.md) |
+| Docs | [Recovery architecture](docs/recovery-access-architecture.md) · [Device behavior & LED](docs/device-behavior.md) · [CLI reference](docs/cli-reference.md) · [Flashing for AI agents](docs/agent-flashing.md) |
 
 ## Contributing
 
