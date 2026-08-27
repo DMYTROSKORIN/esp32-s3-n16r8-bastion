@@ -474,11 +474,34 @@ void handleApply() {
 void setupPortalStart() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP_STA);  // STA side stays idle but enables network scans.
-  WiFi.softAPConfig(kApIp, kApIp, kApMask);
-  WiFi.softAP(kApName);
+
+  // This access point is the device's only provisioning path - if it never
+  // comes up, an unprovisioned unit is permanently unreachable without a
+  // physical reflash. A transient radio/allocation failure is worth a few
+  // retries before giving up and rebooting to try the whole sequence again,
+  // rather than silently proceeding to start an HTTP server nobody can
+  // reach and logging a misleadingly confident "portal open" message.
+  bool apReady = false;
+  for (uint8_t attempt = 0; attempt < 3 && !apReady; ++attempt) {
+    apReady = WiFi.softAPConfig(kApIp, kApIp, kApMask) && WiFi.softAP(kApName);
+    if (!apReady) {
+      Serial.println("Portal: failed to start access point, retrying");
+      WiFi.softAPdisconnect(true);
+      delay(500);
+    }
+  }
+  if (!apReady) {
+    Serial.println("Portal: could not start access point after retries; rebooting");
+    delay(500);
+    ESP.restart();
+  }
 
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-  dnsServer.start(kDnsPort, "*", kApIp);
+  if (!dnsServer.start(kDnsPort, "*", kApIp)) {
+    // Non-fatal: captive-portal auto-popup won't fire, but the HTTP server
+    // below is still reachable by navigating to the AP's address directly.
+    Serial.println("Portal: captive DNS failed to start; open http://192.168.4.1/ manually");
+  }
 
   httpServer.on("/", handleRoot);
   httpServer.on("/api/config", HTTP_GET, handleConfig);

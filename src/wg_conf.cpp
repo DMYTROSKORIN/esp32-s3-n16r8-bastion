@@ -144,8 +144,19 @@ bool handleAddress(Parser& parser, const char* value, WgProfileConfig& profile,
     if (*addressSeen) {
       return parser.fail("exactly one IPv4 Interface Address is required");
     }
-    if (address == 0) {
-      return parser.fail("Interface Address cannot be 0.0.0.0");
+    // Reject addresses that can never be a real single host on the tunnel:
+    // 0.0.0.0/8, multicast/reserved (224-255), and - when a prefix narrower
+    // than /32 is given - the network and broadcast addresses of that
+    // subnet. Any of these installed as the WireGuard interface address
+    // would silently misroute or drop the device's own tunnel traffic.
+    if ((address >> 24) == 0 || (address >> 24) >= 224) {
+      return parser.fail("Interface Address cannot be 0.0.0.0 or a multicast/reserved address");
+    }
+    if (prefix < 32) {
+      const uint32_t mask = prefixToMask(prefix);
+      if ((address & ~mask) == 0 || (address & ~mask) == (~mask & 0xffffffffU)) {
+        return parser.fail("Interface Address cannot be a network or broadcast address");
+      }
     }
     *addressSeen = true;
     formatIpv4(address, profile.address, sizeof(profile.address));

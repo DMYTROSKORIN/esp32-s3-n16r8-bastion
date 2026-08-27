@@ -17,6 +17,13 @@ constexpr uint32_t kMaintainIntervalMs = 60000;
 constexpr uint32_t kMaintainProbeTimeoutMs = 400;
 constexpr uint16_t kWolPort = 9;
 
+// pcMac/pcMacValid/pcMacLoaded are written from the main loop (learning a
+// freshly-seen MAC, core 1) and read from the SSH task (dashboard/pc
+// wake/pc status, core 0). A spinlock plus copying a snapshot before use
+// keeps every read and write of these three fields consistent with each
+// other, instead of a formatter or a wake packet potentially mixing bytes
+// from an old and a newly-learned MAC.
+portMUX_TYPE pcMacMux = portMUX_INITIALIZER_UNLOCKED;
 uint8_t pcMac[6] = {};
 bool pcMacValid = false;
 bool pcMacLoaded = false;
@@ -76,10 +83,24 @@ bool arpLookup(const IPAddress& ip, uint8_t mac[6]) {
 }
 
 void ensureMacLoaded() {
+  if (pcMacLoaded) {
+    return;
+  }
+  // NVS access happens outside the critical section (it can be slow); the
+  // section only publishes the result, and the pcMacLoaded check inside it
+  // makes a race between two first-callers harmless (the loser's read is
+  // simply discarded instead of double-applied).
+  uint8_t loaded[6];
+  const bool valid = deviceConfigMacLoad(loaded);
+  portENTER_CRITICAL(&pcMacMux);
   if (!pcMacLoaded) {
     pcMacLoaded = true;
-    pcMacValid = deviceConfigMacLoad(pcMac);
+    if (valid) {
+      memcpy(pcMac, loaded, 6);
+      pcMacValid = true;
+    }
   }
+  portEXIT_CRITICAL(&pcMacMux);
 }
 
 IPAddress configuredPcIp() {
@@ -118,26 +139,45 @@ void mainPcMaintain() {
   }
   // The TCP probe just refreshed the ARP entry for the PC.
   uint8_t learned[6];
-  if (arpLookup(configuredPcIp(), learned) &&
-      (!pcMacValid || memcmp(learned, pcMac, 6) != 0)) {
+  if (!arpLookup(configuredPcIp(), learned)) {
+    return;
+  }
+
+  bool changed = false;
+  portENTER_CRITICAL(&pcMacMux);
+  if (!pcMacValid || memcmp(learned, pcMac, 6) != 0) {
     memcpy(pcMac, learned, 6);
     pcMacValid = true;
-    deviceConfigMacStore(pcMac);
+    changed = true;
+  }
+  portEXIT_CRITICAL(&pcMacMux);
+
+  if (changed) {
+    deviceConfigMacStore(learned);
     Serial.printf("Main PC: learned MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
-                  pcMac[0], pcMac[1], pcMac[2], pcMac[3], pcMac[4], pcMac[5]);
+                  learned[0], learned[1], learned[2], learned[3], learned[4],
+                  learned[5]);
   }
 }
 
 bool mainPcMacKnown() {
   ensureMacLoaded();
-  return pcMacValid;
+  portENTER_CRITICAL(&pcMacMux);
+  const bool valid = pcMacValid;
+  portEXIT_CRITICAL(&pcMacMux);
+  return valid;
 }
 
 void mainPcMacString(char* out, size_t outSize) {
   ensureMacLoaded();
-  if (pcMacValid) {
-    snprintf(out, outSize, "%02x:%02x:%02x:%02x:%02x:%02x", pcMac[0], pcMac[1],
-             pcMac[2], pcMac[3], pcMac[4], pcMac[5]);
+  uint8_t snapshot[6];
+  portENTER_CRITICAL(&pcMacMux);
+  const bool valid = pcMacValid;
+  memcpy(snapshot, pcMac, 6);
+  portEXIT_CRITICAL(&pcMacMux);
+  if (valid) {
+    snprintf(out, outSize, "%02x:%02x:%02x:%02x:%02x:%02x", snapshot[0],
+             snapshot[1], snapshot[2], snapshot[3], snapshot[4], snapshot[5]);
   } else {
     snprintf(out, outSize, "not learned yet");
   }
@@ -145,14 +185,19 @@ void mainPcMacString(char* out, size_t outSize) {
 
 bool mainPcWake() {
   ensureMacLoaded();
-  if (!pcMacValid || WiFi.status() != WL_CONNECTED) {
+  uint8_t snapshot[6];
+  portENTER_CRITICAL(&pcMacMux);
+  const bool valid = pcMacValid;
+  memcpy(snapshot, pcMac, 6);
+  portEXIT_CRITICAL(&pcMacMux);
+  if (!valid || WiFi.status() != WL_CONNECTED) {
     return false;
   }
 
   uint8_t packet[102];
   memset(packet, 0xff, 6);
   for (size_t repeat = 0; repeat < 16; ++repeat) {
-    memcpy(packet + 6 + repeat * 6, pcMac, 6);
+    memcpy(packet + 6 + repeat * 6, snapshot, 6);
   }
 
   const uint32_t ip = static_cast<uint32_t>(WiFi.localIP());

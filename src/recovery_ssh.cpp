@@ -81,10 +81,18 @@ bool writeAllToChannel(ssh_channel channel, const uint8_t* data, int length) {
   return true;
 }
 
+// A failed write means the channel is stalled or gone; closing it here (once,
+// centrally) makes every subsequent ssh_channel_is_open() check in the shell
+// loop and in writeAllToChannel() itself false immediately, instead of each
+// remaining dashboard row/prompt write separately re-discovering the same
+// dead channel through its own 30 s stall timeout.
 void channelWrite(ssh_channel channel, const char* text) {
   if (channel != nullptr && text != nullptr) {
-    writeAllToChannel(channel, reinterpret_cast<const uint8_t*>(text),
-                      static_cast<int>(strlen(text)));
+    if (!writeAllToChannel(channel, reinterpret_cast<const uint8_t*>(text),
+                           static_cast<int>(strlen(text))) &&
+        ssh_channel_is_open(channel)) {
+      ssh_channel_close(channel);
+    }
   }
 }
 
@@ -523,7 +531,11 @@ void serveShell(ssh_channel channel) {
         }
       } else if (input >= 32 && input <= 126 && line.length() < 127) {
         line += input;
-        writeAllToChannel(channel, reinterpret_cast<const uint8_t*>(&input), 1);
+        if (!writeAllToChannel(channel, reinterpret_cast<const uint8_t*>(&input),
+                               1) &&
+            ssh_channel_is_open(channel)) {
+          ssh_channel_close(channel);
+        }
       }
     }
   }
@@ -569,8 +581,8 @@ void relayDirectTcpip(ssh_channel channel) {
   ssh_channel_set_blocking(channel, 1);
   uint8_t buffer[1024];
   uint32_t lastActivityMs = millis();
-  uint32_t totalToTarget = 0;
-  uint32_t totalToChannel = 0;
+  uint64_t totalToTarget = 0;
+  uint64_t totalToChannel = 0;
   const char* closeReason = "peer closed";
   // A client that closes its write side (SSH EOF) only means "no more input
   // coming from me" - the PC may still be mid-response. Stop forwarding
@@ -629,8 +641,9 @@ void relayDirectTcpip(ssh_channel channel) {
     delay(1);
   }
 
-  Serial.printf("Relay: closed (%s), bytes to-PC=%u to-client=%u\n",
-                closeReason, totalToTarget, totalToChannel);
+  Serial.printf("Relay: closed (%s), bytes to-PC=%llu to-client=%llu\n",
+                closeReason, static_cast<unsigned long long>(totalToTarget),
+                static_cast<unsigned long long>(totalToChannel));
   target.stop();
   ssh_channel_send_eof(channel);
   ssh_channel_close(channel);
@@ -649,6 +662,9 @@ void handleAuthenticatedSession(ssh_session session) {
       if (subtype == SSH_CHANNEL_SESSION) {
         ssh_channel channel = ssh_message_channel_request_open_reply_accept(message);
         ssh_message_free(message);
+        if (channel == nullptr) {
+          return;
+        }
 
         bool shellRequested = false;
         while (!shellRequested && millis() - startedMs < kPreShellDeadlineMs) {
@@ -690,8 +706,10 @@ void handleAuthenticatedSession(ssh_session session) {
             destinationPort == gDeviceConfig.pcPort) {
           ssh_channel channel = ssh_message_channel_request_open_reply_accept(message);
           ssh_message_free(message);
-          relayDirectTcpip(channel);
-          ssh_channel_free(channel);
+          if (channel != nullptr) {
+            relayDirectTcpip(channel);
+            ssh_channel_free(channel);
+          }
           return;
         }
       }
@@ -727,6 +745,21 @@ bool importAuthorizedKey() {
   return true;
 }
 
+// Applies the fixed bind options and starts listening. Used both for the
+// initial bind and to rebuild one that has started failing every accept.
+bool configureAndListen(ssh_bind bind) {
+  ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BINDADDR, kBindAddress);
+  ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BINDPORT_STR, kBindPort);
+  ssh_bind_options_set(bind, SSH_BIND_OPTIONS_HOSTKEY, kHostKeyVfsPath);
+  int verbosity = SSH_LOG_WARN;
+  ssh_bind_options_set(bind, SSH_BIND_OPTIONS_LOG_VERBOSITY, &verbosity);
+  if (ssh_bind_listen(bind) != SSH_OK) {
+    Serial.printf("SSH: listen failed: %s\n", ssh_get_error(bind));
+    return false;
+  }
+  return true;
+}
+
 void sshServerTask(void*) {
   while (WiFi.status() != WL_CONNECTED) {
     delay(250);
@@ -745,20 +778,22 @@ void sshServerTask(void*) {
     vTaskDelete(nullptr);
     return;
   }
-  ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BINDADDR, kBindAddress);
-  ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BINDPORT_STR, kBindPort);
-  ssh_bind_options_set(bind, SSH_BIND_OPTIONS_HOSTKEY, kHostKeyVfsPath);
-  int verbosity = SSH_LOG_WARN;
-  ssh_bind_options_set(bind, SSH_BIND_OPTIONS_LOG_VERBOSITY, &verbosity);
-
-  if (ssh_bind_listen(bind) != SSH_OK) {
-    Serial.printf("SSH: listen failed: %s\n", ssh_get_error(bind));
+  if (!configureAndListen(bind)) {
     ssh_bind_free(bind);
     vTaskDelete(nullptr);
     return;
   }
   Serial.printf("SSH: listening on %s:%s as %s\n", WiFi.localIP().toString().c_str(),
                 kBindPort, gDeviceConfig.sshUser);
+
+  // ssh_bind_accept() failing over and over (rather than just once, which is
+  // routine for a dropped/reset peer) means the listening socket itself has
+  // wedged - e.g. after a Wi-Fi interface reset. Without this, the task would
+  // spin accept-fail/disconnect/free forever, permanently and silently
+  // disabling the recovery console. Recreating the bind gives it a chance to
+  // self-heal instead of requiring a power cycle.
+  constexpr uint8_t kMaxConsecutiveAcceptFailures = 10;
+  uint8_t consecutiveAcceptFailures = 0;
 
   while (true) {
     ssh_session session = ssh_new();
@@ -767,10 +802,29 @@ void sshServerTask(void*) {
       continue;
     }
     if (ssh_bind_accept(bind, session) == SSH_OK) {
+      consecutiveAcceptFailures = 0;
       hardenSessionTransport(session);
       if (ssh_handle_key_exchange(session) == SSH_OK &&
           authenticateSession(session)) {
         handleAuthenticatedSession(session);
+      }
+    } else {
+      Serial.printf("SSH: accept failed: %s\n", ssh_get_error(bind));
+      if (++consecutiveAcceptFailures >= kMaxConsecutiveAcceptFailures) {
+        Serial.println("SSH: too many consecutive accept failures, rebuilding listener");
+        ssh_bind_free(bind);
+        bind = ssh_bind_new();
+        if (bind == nullptr || !configureAndListen(bind)) {
+          Serial.println("SSH: failed to rebuild listener");
+          if (bind != nullptr) {
+            ssh_bind_free(bind);
+          }
+          ssh_disconnect(session);
+          ssh_free(session);
+          vTaskDelete(nullptr);
+          return;
+        }
+        consecutiveAcceptFailures = 0;
       }
     }
     ssh_disconnect(session);

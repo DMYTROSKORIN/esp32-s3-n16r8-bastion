@@ -1,5 +1,6 @@
 #include "device_config.h"
 
+#include <Arduino.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
@@ -54,17 +55,36 @@ bool deviceConfigPresent() {
 }
 
 void deviceConfigFactoryReset() {
-  Preferences prefs;
-  if (prefs.begin(kNamespace, false)) {
-    prefs.clear();
-    prefs.end();
+  // This is the device's only "wipe my credentials" path, so a silent
+  // failure here is worse than usual: the caller reboots right after this
+  // returns believing the reset succeeded, while Wi-Fi/SSH credentials or
+  // the host key could still be sitting in flash. One retry plus a clear
+  // serial warning on persistent failure at least makes that visible.
+  bool cleared = false;
+  for (uint8_t attempt = 0; attempt < 2 && !cleared; ++attempt) {
+    Preferences prefs;
+    if (prefs.begin(kNamespace, false)) {
+      cleared = prefs.clear();
+      prefs.end();
+    }
   }
+  if (!cleared) {
+    Serial.println("Factory reset: failed to clear stored preferences");
+  }
+
   // Earlier firmware revisions stored credentials in the WiFi library's own
   // NVS namespace; wipe those too so the radio never rejoins on its own.
   WiFi.disconnect(true, true);
-  if (SPIFFS.begin(true)) {
-    SPIFFS.remove(kHostKeyFsPath);
-    SPIFFS.end();
+
+  bool keyRemoved = false;
+  for (uint8_t attempt = 0; attempt < 2 && !keyRemoved; ++attempt) {
+    if (SPIFFS.begin(true)) {
+      keyRemoved = !SPIFFS.exists(kHostKeyFsPath) || SPIFFS.remove(kHostKeyFsPath);
+      SPIFFS.end();
+    }
+  }
+  if (!keyRemoved) {
+    Serial.println("Factory reset: failed to remove SSH host key");
   }
   // The persistent state above is what matters and is now cleared; the
   // caller restarts within ~2 s of this call, so gDeviceConfig itself is
@@ -88,18 +108,30 @@ bool deviceConfigMacLoad(uint8_t mac[6]) {
 
 void deviceConfigMacStore(const uint8_t mac[6]) {
   Preferences prefs;
-  if (prefs.begin(kNamespace, false)) {
-    prefs.putBytes(kMacKey, mac, 6);
-    prefs.end();
+  if (!prefs.begin(kNamespace, false)) {
+    Serial.println("Main PC: failed to open storage for learned MAC");
+    return;
   }
+  if (prefs.putBytes(kMacKey, mac, 6) != 6) {
+    Serial.println("Main PC: failed to persist learned MAC");
+  }
+  prefs.end();
 }
 
 void portalRequestFlagSet() {
   Preferences prefs;
-  if (prefs.begin(kNamespace, false)) {
-    prefs.putUChar(kPortalKey, 1);
-    prefs.end();
+  if (!prefs.begin(kNamespace, false)) {
+    Serial.println("Portal: failed to open storage for portal-reopen flag");
+    return;
   }
+  // A failure here means the BOOT-5s "reopen portal" request silently does
+  // nothing on the next boot instead of opening the portal - the device just
+  // reboots into its normal connected state, which looks like the button
+  // press was ignored rather than like a storage error.
+  if (prefs.putUChar(kPortalKey, 1) != 1) {
+    Serial.println("Portal: failed to persist portal-reopen flag");
+  }
+  prefs.end();
 }
 
 bool portalRequestFlagTake() {

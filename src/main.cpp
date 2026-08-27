@@ -42,8 +42,35 @@ DeviceState deviceState = DeviceState::kConnecting;
 uint32_t stateStartedMs = 0;
 uint32_t lastReconnectMs = 0;
 uint32_t lastInternetCheckMs = 0;
-uint32_t bootPressedMs = 0;
 uint32_t bootHoldElapsedMs = 0;
+
+// loop() can block for up to ~2.4 s at a time (the internet check below, the
+// PC reachability probe in mainPcMaintain()) while still needing to time a
+// human's BOOT-button hold accurately enough to tell a 5 s press from a 10 s
+// one. Sampling digitalRead() once per loop() iteration missed or
+// mistimed press/release edges that happened to fall inside one of those
+// blocking windows. An interrupt latches the true edge timestamps the
+// instant they happen, independent of how late loop() gets around to
+// reading them.
+portMUX_TYPE bootButtonMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool bootButtonPressed = false;
+volatile uint32_t bootPressStartMs = 0;
+volatile uint32_t bootReleaseMs = 0;
+volatile bool bootReleasePending = false;
+
+void IRAM_ATTR bootButtonIsr() {
+  const uint32_t now = millis();
+  portENTER_CRITICAL_ISR(&bootButtonMux);
+  if (digitalRead(kBootButtonPin) == LOW) {
+    bootButtonPressed = true;
+    bootPressStartMs = now;
+  } else {
+    bootButtonPressed = false;
+    bootReleaseMs = now;
+    bootReleasePending = true;
+  }
+  portEXIT_CRITICAL_ISR(&bootButtonMux);
+}
 
 void setLed(uint8_t red, uint8_t green, uint8_t blue) {
   static uint8_t previousRed = 255;
@@ -209,25 +236,30 @@ void doFactoryReset() {
 }
 
 void handleBootButton() {
-  const bool pressed = digitalRead(kBootButtonPin) == LOW;
+  // Snapshot the ISR-latched state; this is what makes the hold-duration
+  // classification below correct regardless of how late this particular
+  // loop() iteration is running.
+  portENTER_CRITICAL(&bootButtonMux);
+  const bool pressed = bootButtonPressed;
+  const uint32_t pressStartMs = bootPressStartMs;
+  const bool releasePending = bootReleasePending;
+  const uint32_t releaseMs = bootReleaseMs;
+  bootReleasePending = false;
+  portEXIT_CRITICAL(&bootButtonMux);
+
+  if (releasePending && releaseMs - pressStartMs >= kEditModeHoldMs) {
+    Serial.println("BOOT held 5s: reopening setup portal.");
+    portalRequestFlagSet();
+    delay(200);
+    ESP.restart();
+  }
 
   if (!pressed) {
-    if (bootPressedMs != 0 && millis() - bootPressedMs >= kEditModeHoldMs) {
-      Serial.println("BOOT held 5s: reopening setup portal.");
-      portalRequestFlagSet();
-      delay(200);
-      ESP.restart();
-    }
-    bootPressedMs = 0;
     bootHoldElapsedMs = 0;
     return;
   }
 
-  if (bootPressedMs == 0) {
-    bootPressedMs = millis();
-  }
-  bootHoldElapsedMs = millis() - bootPressedMs;
-
+  bootHoldElapsedMs = millis() - pressStartMs;
   if (bootHoldElapsedMs >= kFactoryResetHoldMs) {
     doFactoryReset();  // Does not return.
   }
@@ -275,6 +307,11 @@ void setup() {
   heap_caps_malloc_extmem_enable(512);
 
   pinMode(kBootButtonPin, INPUT_PULLUP);
+  // Initialize from the current level in case BOOT is already held at boot
+  // (no edge would otherwise ever fire for it), then track further edges.
+  bootButtonPressed = digitalRead(kBootButtonPin) == LOW;
+  bootPressStartMs = millis();
+  attachInterrupt(digitalPinToInterrupt(kBootButtonPin), bootButtonIsr, CHANGE);
 
   Serial.println();
   Serial.println("ESP32-S3-N16R8 Bastion starting");

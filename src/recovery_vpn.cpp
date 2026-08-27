@@ -44,10 +44,16 @@ enum class VpnRequest : uint8_t { kNone, kFailover, kPrimary };
 
 wireguard_config_t wireGuardConfig = ESP_WIREGUARD_CONFIG_DEFAULT();
 wireguard_ctx_t wireGuardContext = ESP_WIREGUARD_CONTEXT_DEFAULT();
-volatile VpnState vpnState = VpnState::kNotConfigured;
-volatile int8_t activeProfile = -1;
-volatile uint8_t consecutiveFailures = 0;
-volatile uint32_t handshakeAgeSeconds = UINT32_MAX;
+// The VPN task (core 1) writes these; the SSH task (core 0) and the main
+// loop read them for the dashboard/status commands. `volatile` only stops
+// the compiler from caching a value in a register - it is not a C++
+// synchronization primitive and does not make cross-core reads/writes of a
+// plain variable well-defined. std::atomic is the correct tool here and
+// costs nothing extra on scalars this small.
+std::atomic<VpnState> vpnState{VpnState::kNotConfigured};
+std::atomic<int8_t> activeProfile{-1};
+std::atomic<uint8_t> consecutiveFailures{0};
+std::atomic<uint32_t> handshakeAgeSeconds{UINT32_MAX};
 std::atomic<VpnRequest> pendingRequest{VpnRequest::kNone};
 bool tunnelInitialized = false;
 uint32_t profileStartedMs = 0;
@@ -297,7 +303,8 @@ void vpnTask(void*) {
 
     noteFailure();
     Serial.printf("WireGuard: profile %u health check failed (%u/%u)\n",
-                  activeProfile + 1, consecutiveFailures, kFailuresBeforeFailover);
+                  activeProfile + 1, consecutiveFailures.load(),
+                  kFailuresBeforeFailover);
     if (profileCount() > 1 && consecutiveFailures >= kFailuresBeforeFailover) {
       desiredProfile = activeProfile == 0 ? 1 : 0;
       Serial.printf("WireGuard: failing over to profile %u\n", desiredProfile + 1);
