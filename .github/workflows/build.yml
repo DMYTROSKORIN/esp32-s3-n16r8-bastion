@@ -36,7 +36,11 @@ jobs:
             pio-idf5-${{ runner.os }}-
 
       - name: Install PlatformIO and signing dependencies
-        run: pip install --upgrade platformio cryptography
+        # Pinned: pioarduino's HybridCompile step (rebuilding the IDF libraries
+        # with the project's sdkconfig) fails under PlatformIO 6.2.0 with
+        # "No module named 'SCons.Tool.FortranCommon'"; 6.1.19 is what the
+        # firmware is built and tested with locally.
+        run: pip install "platformio==6.1.19" cryptography
 
       - name: Build (default, custom core)
         run: pio run -e esp32-s3-n16r8
