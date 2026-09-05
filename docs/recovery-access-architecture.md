@@ -315,6 +315,8 @@ Commands:
 | `pc ping [count]` | ICMP check of the PC's LAN address via `esp_ping` | implemented |
 | `logs [n]` | Recent events from the in-memory journal | implemented |
 | `reboot` | Reboot the ESP32 after `reboot yes` confirmation | implemented |
+| `ota status` / `ota <https-url>` / `ota rollback yes` | A/B firmware update, see "Over-the-air updates" | implemented |
+| `ssh user@board <command>` | any console command non-interactively; `ota` reads an image from stdin | implemented |
 
 The TCP tunnel to the PC is implemented as a standard SSH `direct-tcpip`
 channel: the board acts as a jump host (`ssh -J`), and only a single
@@ -331,6 +333,84 @@ firmware actually does.
 A standard SSH `direct-tcpip` channel is the preferred way to reach the Linux
 PC over plain SSH. It lets the ESP32 act as a jump host without standing up a
 general SOCKS proxy or routing the whole subnet.
+
+## Over-the-air updates
+
+Since 1.2.0 the board updates itself in place, using the two 6.25 MB app
+slots of the 16 MB partition table (`app0`/`app1`) in the classic A/B
+pattern (`src/ota_update.cpp`).
+
+### Image format
+
+CI (and `scripts/ota_sign.py sign` locally) turns the build's `firmware.bin`
+into `firmware-signed.bin`:
+
+```text
+[ ESP-IDF app image ][ 32-byte version, NUL-padded ][ 64-byte Ed25519 signature ]
+                     └────── signed: SHA-256(image || version field) ──────┘
+```
+
+The public key is compiled into the firmware (`include/ota_public_key.h`);
+the private key exists only in the GitHub repository secret
+`OTA_SIGNING_KEY` and in the maintainer's `~/.config/esp32-bastion/`. A
+board therefore accepts only images produced by this project's CI (or by
+someone holding that key); anyone building their own fork regenerates the
+pair with `ota_sign.py keygen` and the header with `pubkey --header`.
+
+### Delivery paths
+
+| Path | Command | Needs |
+|---|---|---|
+| Push over SSH | `ssh user@board ota < firmware-signed.bin` | the console reachable (LAN, WireGuard, or `-J`); no internet on the board |
+| Pull over HTTPS | `ota https://…/firmware-signed.bin` at the prompt | internet on the board; `https://` only, validated against the ESP-IDF CA bundle; up to 5 redirects (GitHub Releases redirect to `objects.githubusercontent.com`) |
+
+Both feed the same streaming sink: bytes go to `esp_ota_write()` into the
+inactive slot as they arrive (sequential erase, so the first progress line
+appears immediately), SHA-256 is computed on the fly, and the last 96 bytes
+are held back as the trailer. Nothing is decided until the stream ends:
+then the signature is checked against the digest, `esp_ota_end()` runs
+ESP-IDF's own image validation (segments, checksum, embedded SHA-256), and
+only then `esp_ota_set_boot_partition()` points the bootloader at the new
+slot. A rejected image leaves the running firmware and the other slot
+untouched; the SSH exec exits with status 1 and the reason. Uploaded
+non-images are rejected on the first chunk (ESP image magic byte).
+
+### Self-test and rollback
+
+With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` the bootloader marks a newly
+booted slot `pending-verify`. The Arduino core would confirm it
+unconditionally during start-up; `verifyRollbackLater()` is overridden so
+that the firmware's own self-test decides:
+
+- **pass**: Wi-Fi associated and the SSH server listening (or the setup
+  portal up, which is where a firmware with a changed config layout
+  legitimately lands) within **120 s** → `esp_ota_mark_app_valid_cancel_rollback()`;
+- **fail**: the budget expires, or the image panics / trips the watchdog
+  before confirming → `esp_ota_mark_app_invalid_rollback_and_reboot()`, and
+  the bootloader boots the previous slot again.
+
+Verified on the bench (2026-09-06): an image built with the self-test
+deliberately sabotaged booted, failed the 120 s test and the board came
+back on the previous image; a valid image passed after 2 s. The outcome of
+every OTA step is journaled and the last one is also kept in NVS
+(`recovery/ota_last`), because the journal itself dies with the reboot
+that follows an update - `ota status` shows it.
+
+What the update never touches: NVS (all provisioned settings, the learned
+MAC, boot counter), SPIFFS (SSH host key), the other app slot. A new
+firmware whose `DeviceConfig` layout changed will open the setup portal
+exactly as after a USB flash; that state passes the self-test.
+
+### Non-goals and limits
+
+- No downgrade protection: any correctly signed image installs, including
+  an older one - by design, so that a bad release can be undone by
+  installing the previous release the same way (or `ota rollback yes`).
+- The console is single-session; while an image is being received (10-20 s
+  on the LAN, up to a minute or two through WireGuard for 1.7 MB) nothing
+  else can log in.
+- The bootloader itself and the partition table are not updated over the
+  air. Both are stable; changing either still requires USB.
 
 ## Wake-on-Wireless LAN
 
@@ -689,9 +769,8 @@ Implemented:
 
 Planned:
 
-- A/B OTA (the 16 MB partition table already provides `app0`/`app1`),
-  new-version verification, and automatic rollback;
-- a persisted copy of the last N journal lines across a watchdog reboot;
+- a persisted copy of the last N journal lines across a watchdog reboot
+  (the last OTA event already survives in NVS);
 - keeping the last known-good configuration until a new one is verified;
 - a stable, independent power supply (brownout resets are already detected
   by the chip and show up as `reset: brownout` in the dashboard and journal);
@@ -716,11 +795,13 @@ Planned:
    a web portal on the running device~~ — done (see "Provisioning through
    the setup portal" above). Transactional rollback (restoring the previous
    working set of profiles if the new one fails verification) — planned.
-8. A/B OTA and extended soak testing. The task watchdog, the Wi-Fi-loss
-   restart and the journal (1.0.0) are the groundwork for it.
+8. ~~A/B OTA with signature verification and automatic rollback~~ — done
+   in 1.2.0 (see "Over-the-air updates"); extended soak testing continues.
 9. Production hardening: Secure Boot, Flash Encryption, unique keys, a
    password on `ESP32_SetUp` or some other protection for provisioning
-   against eavesdropping (see "Wizard security" above).
+   against eavesdropping (see "Wizard security" above). Signed OTA images
+   (1.2.0) cover the update path; Secure Boot would extend the same
+   guarantee to the bootloader and to USB flashing.
 
 ## Diagnosing common failures
 

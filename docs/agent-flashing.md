@@ -75,6 +75,14 @@ around.
 ~/.platformio/penv/bin/pio run -t upload --upload-port /dev/ttyACM0   # or whatever you found above
 ```
 
+USB is needed only for a first flash or when the bootloader/partition table changes. A board that
+already runs 1.2.0+ can be updated over the air instead, which also gives you automatic rollback
+if the new image does not come up: sign the build (`scripts/ota_sign.py sign --key <key> --version
+<v> --in .pio/build/esp32-s3-n16r8/firmware.bin --out firmware-signed.bin`, the key is the
+maintainer's, not in the repo) and run `ssh <user>@<board> ota < firmware-signed.bin`. You cannot do
+that step without the signing key and the owner's SSH access - if you have neither, stop and hand
+the signed image or the build back to the human.
+
 This only rewrites program flash; it does not erase the NVS partition, so a previously provisioned
 board normally keeps its Wi-Fi/PC/SSH/WireGuard settings across a flash — see the layout-change
 exception below. One caveat when upgrading a board from a pre-1.0.0 build: the partition table

@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: PlatformIO build (esp32-s3-n16r8, custom core)
@@ -32,8 +35,8 @@ jobs:
           restore-keys: |
             pio-idf5-${{ runner.os }}-
 
-      - name: Install PlatformIO
-        run: pip install --upgrade platformio
+      - name: Install PlatformIO and signing dependencies
+        run: pip install --upgrade platformio cryptography
 
       - name: Build (default, custom core)
         run: pio run -e esp32-s3-n16r8
@@ -41,9 +44,31 @@ jobs:
       - name: Build (legacy, prebuilt core)
         run: pio run -e esp32-s3-n16r8-legacy
 
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            ini=$(sed -n 's/.*-DFIRMWARE_VERSION=\\"\([^"\\]*\)\\".*/\1/p' platformio.ini | head -n1)
+            echo "version=${ini}+${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign OTA image
+        if: ${{ env.OTA_SIGNING_KEY != '' }}
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+        run: |
+          python scripts/ota_sign.py sign \
+            --version "${{ steps.version.outputs.version }}" \
+            --in .pio/build/esp32-s3-n16r8/firmware.bin \
+            --out .pio/build/esp32-s3-n16r8/firmware-signed.bin
+          python scripts/ota_sign.py verify --header include/ota_public_key.h \
+            --in .pio/build/esp32-s3-n16r8/firmware-signed.bin
+
       - name: Report size
         run: |
-          ls -l .pio/build/esp32-s3-n16r8/firmware.bin .pio/build/esp32-s3-n16r8-legacy/firmware.bin
+          ls -l .pio/build/esp32-s3-n16r8/firmware*.bin .pio/build/esp32-s3-n16r8-legacy/firmware.bin
 
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
@@ -51,7 +76,24 @@ jobs:
           name: esp32-s3-n16r8-bastion-${{ github.sha }}
           path: |
             .pio/build/esp32-s3-n16r8/firmware.bin
+            .pio/build/esp32-s3-n16r8/firmware-signed.bin
             .pio/build/esp32-s3-n16r8/bootloader.bin
             .pio/build/esp32-s3-n16r8/partitions.bin
             .pio/build/esp32-s3-n16r8-legacy/firmware.bin
           if-no-files-found: error
+
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            .pio/build/esp32-s3-n16r8/firmware-signed.bin
+            .pio/build/esp32-s3-n16r8/firmware.bin
+            .pio/build/esp32-s3-n16r8/bootloader.bin
+            .pio/build/esp32-s3-n16r8/partitions.bin
+          body: |
+            Signed OTA image: `firmware-signed.bin`. Install with
+            `ssh <user>@<board> ota < firmware-signed.bin` or, from the console,
+            `ota https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/firmware-signed.bin`.
+            `firmware.bin` + `bootloader.bin` + `partitions.bin` are for a USB flash.
+            See CHANGELOG.md for what changed.

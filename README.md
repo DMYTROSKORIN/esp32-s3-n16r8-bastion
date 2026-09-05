@@ -5,7 +5,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.1.0-2ea44f.svg"></a>
+  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.2.0-2ea44f.svg"></a>
   <a href=".github/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/DMYTROSKORIN/esp32-s3-n16r8-bastion/build.yml?branch=main&label=build"></a>
   <img alt="Platform" src="https://img.shields.io/badge/board-ESP32--S3--N16R8%20only-e07020.svg">
   <img alt="Framework" src="https://img.shields.io/badge/framework-Arduino%20%2F%20PlatformIO-00979d.svg">
@@ -61,23 +61,25 @@ before attempting a port.
 The SSH console opens straight into a live status dashboard — no separate monitoring needed:
 
 ```text
-  ESP32 Recovery Gateway  ESP32-S3-N16R8 v1.1.0 · power-on
-  ────────────────────────────────────────────────
-  Device     ● ONLINE    uptime 0d 00:07:44
-  Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm  up 0d 00:07:39
+  ESP32 Recovery Gateway   v1.2.0   ESP32-S3-N16R8  • reset: power-on
+  ──────────────────────────────────────────────────────────────────────────────
+  Device     ● ONLINE     up 0d 00:07:44
+  Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
   Internet   ● ONLINE
-  WireGuard  ● ONLINE    profile-1  10.66.0.2  handshake 10s ago
-  Main PC    ● ONLINE    192.168.1.200  ssh :22 open
-  WoWLAN     ● STANDBY   AA:BB:CC:DD:EE:FF
-  Memory       heap 196 KB (min 171 KB)  psram 8034/8189 KB  sessions 3
-  ────────────────────────────────────────────────
-  help commands   pc ssh how to reach the PC   pc wake wake it up
+  WireGuard  ● ONLINE     profile-1  10.66.0.2  handshake 10 s ago
+  Main PC    ● ONLINE     192.168.1.200:22  ssh open
+  WoWLAN     ● STANDBY    aa:bb:cc:dd:ee:ff
+  Memory     ● OK         heap 121 KB (min 114)  psram 8117/8192 KB
+  Firmware   ● CONFIRMED  slot app0  sessions 3
+  ──────────────────────────────────────────────────────────────────────────────
+  help commands   pc ssh reach the PC   pc wake wake it up   ota update
 ```
 
 Beyond the dashboard the console offers `watch` (auto-refresh), `logs` (a secrets-free event
 journal: Wi-Fi disconnect reasons, VPN transitions, every SSH login and relay close), `pc ping`,
-`pc wake`, `vpn failover` / `vpn retry-primary`, and `reboot` — all with `help <command>`
-generated from the same table that dispatches them. Arrow keys recall history.
+`pc wake`, `vpn failover` / `vpn retry-primary`, `ota` and `reboot` — all with `help <command>`
+generated from the same table that dispatches them. Arrow keys recall history. Any command also
+runs non-interactively: `ssh user@192.168.1.120 logs 50`.
 
 A single onboard RGB LED mirrors the same state without a computer in reach at all — see
 [LED status at a glance](#led-status-at-a-glance) below.
@@ -157,6 +159,29 @@ The relay is built for sustained TUI traffic, not just keystrokes:
 Details, the measurement method and the remaining limits are in
 [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md#ssh-throughput-on-the-esp32-s3).
 
+## Updating the firmware over the air
+
+Once a board runs 1.2.0 or later it never needs the USB cable again. Download `firmware-signed.bin`
+from the [release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) you want and
+either push it over SSH from wherever you can reach the console:
+
+```sh
+ssh user@10.66.0.2 ota < firmware-signed.bin
+```
+
+or let the board fetch it itself, from the console:
+
+```text
+recovery> ota https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases/download/v1.2.0/firmware-signed.bin
+```
+
+Either way the image streams into the inactive OTA slot, is verified (Ed25519 release signature +
+ESP-IDF image check) and only then activated; the board reboots and the new image must bring up
+Wi-Fi and SSH within two minutes or the bootloader rolls back to the previous one on its own. Your
+settings, WireGuard profiles, learned MAC and SSH host key are not touched. `ota status` shows both
+slots and the outcome of the last update; `ota rollback yes` returns to the other slot by hand.
+Details in [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md#over-the-air-updates).
+
 ## Provisioning (Wi-Fi, PC, SSH key, WireGuard)
 
 Everything is entered once through the `ESP32_SetUp` portal — no files are placed in this repository
@@ -235,7 +260,7 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 | | |
 |---|---|
 | Board | **ESP32-S3-N16R8** (16 MB QIO flash, 8 MB OPI PSRAM), DevKitC-1 class — the only supported variant |
-| Firmware | v1.1.0 — see [CHANGELOG.md](CHANGELOG.md) |
+| Firmware | v1.2.0 — see [CHANGELOG.md](CHANGELOG.md); signed OTA images on every [release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) |
 | Framework | Arduino core 3.3.11 / ESP-IDF 5.5.5 via [pioarduino](https://github.com/pioarduino/platform-espressif32) 55.03.311, IDF rebuilt with `custom_sdkconfig`, `-O2`; legacy env on `espressif32 @ 7.0.1` (Arduino 2.0.17) |
 | CI | [GitHub Actions](.github/workflows/build.yml) builds every push and uploads the binaries |
 | SSH server | [LibSSH-ESP32](https://github.com/ewpa/LibSSH-ESP32) (Arduino port of libssh) |
@@ -247,7 +272,7 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 This is a personal-infrastructure project first, but issues and pull requests are welcome, in
 particular around:
 
-- A/B OTA updates with automatic rollback (the 16 MB partition table already has both slots)
+- `ota check`: let the board find the latest release on GitHub by itself
 - Hardening for production deployment (Secure Boot V2, Flash Encryption, per-device signing)
 
 Please keep the runtime-provisioning model intact — no secrets should ever need to be baked into

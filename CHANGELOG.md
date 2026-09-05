@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-09-06
+
+### Added
+
+- **A/B over-the-air updates** with signature verification and automatic
+  rollback (`src/ota_update.cpp`). Two ways in:
+  - `ssh <user>@<board> ota < firmware-signed.bin` streams the image over the
+    SSH connection (works over the LAN, through WireGuard and via `-J`);
+  - `ota https://.../firmware-signed.bin` in the console makes the board
+    download it itself (HTTPS only, public CA bundle, redirects followed, so
+    GitHub Releases URLs work directly).
+  The image is written straight into the inactive slot while SHA-256 is
+  computed; nothing is activated until the Ed25519 release signature (public
+  key in `include/ota_public_key.h`) and ESP-IDF's own image validation pass.
+  After the reboot the new image must bring up Wi-Fi and the SSH server (or
+  the setup portal) within 2 minutes to be confirmed; otherwise the bootloader
+  rolls back to the previous slot. Settings, WireGuard profiles, the learned
+  MAC and the SSH host key are untouched.
+- `ota status` (slots, states, self-test, last OTA event kept in NVS across
+  the reboot) and `ota rollback yes` (boot the other slot's image).
+- `scripts/ota_sign.py`: `keygen` / `pubkey --header` / `sign` / `verify`.
+  Signed image = ESP app image + 32-byte version field + 64-byte Ed25519
+  signature over SHA-256(image || version). CI signs every build with the
+  `OTA_SIGNING_KEY` repository secret and attaches `firmware-signed.bin` to
+  the GitHub Release on tag pushes.
+- **Non-interactive commands**: `ssh <user>@<board> <command>` runs one
+  console command and exits with status 0 (`ssh user@board logs 50`,
+  `ssh user@board pc wake`), which makes the console scriptable.
+- Dashboard redesign: rules span the terminal width (from the SSH `pty-req`),
+  the version is highlighted on its own, addresses/SSID/profile are bright
+  instead of grey, RSSI and free heap are colour-graded, the reset reason is
+  red when it was a panic/watchdog/brownout, and a `Firmware` row shows the
+  running slot and self-test state.
+
+### Fixed
+
+- The Arduino core confirmed a freshly booted OTA image unconditionally at
+  start-up; `verifyRollbackLater()` is now overridden so the self-test decides.
+
+### Tested on the bench
+
+- Tampered image (one byte flipped): rejected, `signature check FAILED`,
+  nothing written. Random data: rejected on the first chunk (bad magic).
+- Valid image over SSH: 1.7 MB in 16-19 s including verification, reboot into
+  the other slot, self-test passed after 2 s, state `valid`.
+- Deliberately broken image (self-test sabotaged): booted, failed the 120 s
+  self-test, bootloader rolled back to the previous image; `ota status`
+  reports the failure from NVS.
+- Download from a GitHub Releases URL from the console: 302 redirect
+  followed, 1.7 MB fetched over TLS and written in ~20 s, verified, rebooted,
+  self-test passed after 2 s.
+
 ## [1.1.0] - 2026-09-05
 
 ### Changed

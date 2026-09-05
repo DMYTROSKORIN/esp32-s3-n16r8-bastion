@@ -27,28 +27,38 @@ secondary details and cyan command hints. The `recovery>` prompt is bold
 green.
 
 ```text
-  ESP32 Recovery Gateway  ESP32-S3-N16R8 v1.1.0 · power-on
-  ────────────────────────────────────────────────
-  Device     ● ONLINE    uptime 0d 00:07:44
-  Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm  up 0d 00:07:39
+  ESP32 Recovery Gateway   v1.2.0   ESP32-S3-N16R8  • reset: power-on
+  ──────────────────────────────────────────────────────────────────────────────
+  Device     ● ONLINE     up 0d 00:07:44
+  Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
   Internet   ● ONLINE
-  WireGuard  ● ONLINE    profile-1  10.66.0.2  handshake 10s ago
-  Main PC    ● ONLINE    192.168.1.200  ssh :22 open
-  WoWLAN     ● STANDBY   AA:BB:CC:DD:EE:FF
-  Memory       heap 196 KB (min 171 KB)  psram 8034/8189 KB  sessions 3
-  ────────────────────────────────────────────────
-  help commands   pc ssh how to reach the PC   pc wake wake it up
+  WireGuard  ● ONLINE     profile-1  10.66.0.2  handshake 10 s ago
+  Main PC    ● ONLINE     192.168.1.200:22  ssh open
+  WoWLAN     ● STANDBY    aa:bb:cc:dd:ee:ff
+  Memory     ● OK         heap 121 KB (min 114)  psram 8117/8192 KB
+  Firmware   ● CONFIRMED  slot app0  sessions 3
+  ──────────────────────────────────────────────────────────────────────────────
+  help commands   pc ssh reach the PC   pc wake wake it up   ota update
 
 recovery>
 ```
 
 Line behavior:
 
-- The header shows the target board, the firmware version and the reason
-  for the last reboot (power-on / software / panic / interrupt-watchdog /
-  task-watchdog / watchdog / brownout / other). A `task-watchdog` there
-  means the 60 s software watchdog fired — see `logs` for what preceded it.
-- `Wi-Fi` shows the SSID, RSSI and for how long the current association
+- The header shows the title, the firmware version highlighted in yellow,
+  the target board and the reason for the last reboot (power-on / software
+  / panic / interrupt-watchdog / task-watchdog / watchdog / brownout /
+  other) - green for the expected reasons, red for the rest. A
+  `task-watchdog` there means the 60 s software watchdog fired — see `logs`
+  for what preceded it.
+- The horizontal rules span the width the SSH client reported in its
+  `pty-req` (clamped to 48-100 columns) and follow window resizes.
+- Colour carries meaning throughout: labels are cyan, the ● and state word
+  are green/yellow/red, the facts you act on (SSID, IP addresses, profile
+  name, MAC) are bright white, context stays in the default colour, and
+  nothing important is dimmed.
+- `Wi-Fi` shows the SSID, RSSI (green above -67 dBm, yellow to -75, red
+  below), channel, the board's IP and for how long the current association
   has lasted (resets to zero on every disconnect).
 - `WireGuard` shows the VPN task's actual state
   (`NOT_CONFIGURED / WAITING / CONNECTING / ONLINE / DEGRADED`) and the
@@ -66,8 +76,12 @@ Line behavior:
   provisioning/reset, so the ARP lookup that follows the probe can
   succeed.
 - `Memory` shows the free internal heap and its low-water mark since boot
-  (a steadily sinking minimum is the early sign of a leak), free/total
-  PSRAM, and how many SSH sessions have authenticated since boot.
+  (a steadily sinking minimum is the early sign of a leak) and free/total
+  PSRAM; the state word is `OK` / `TIGHT` / `LOW` for a minimum above
+  80 KB / above 50 KB / below.
+- `Firmware` shows the running OTA slot, the number of SSH sessions
+  authenticated since boot, and `SELF-TEST` (yellow) while a freshly
+  installed image is still proving itself - see `ota` below.
 
 ## Top-level help
 
@@ -78,7 +92,7 @@ handlers, so this output cannot drift from what the firmware does. The
 actual `help` output in the current firmware:
 
 ```text
-ESP32 Recovery Gateway v1.1.0 - command reference
+ESP32 Recovery Gateway v1.2.0 - command reference
 
 STATUS
   status               Show the complete dashboard
@@ -103,6 +117,7 @@ VPN
 
 DEVICE
   reboot               Restart the ESP32 (asks for confirmation)
+  ota                  Firmware update: ota status | ota <https-url> | ota rollback yes
 
 HELP
   help                 Show this command list; `help <command>` for details
@@ -115,7 +130,22 @@ Examples:
 ```
 
 `?` is a synonym for `help`; `quit` and `logout` are synonyms for `exit`.
-Commands are case-insensitive and tolerate repeated spaces.
+Commands are case-insensitive (arguments such as URLs keep their case) and
+tolerate repeated spaces.
+
+### Non-interactive use
+
+Any command can be given on the `ssh` command line instead of typing it at
+the prompt; the board runs it, prints the result and exits with status 0:
+
+```sh
+ssh user@192.168.1.120 status
+ssh user@192.168.1.120 logs 50 | grep WireGuard
+ssh user@192.168.1.120 pc wake
+```
+
+The special command `ota` with no arguments in this mode reads a signed
+firmware image from standard input - see below.
 
 ### Line editing
 
@@ -226,6 +256,52 @@ address, 500 ms apart, and reports the reply count and min/avg/max RTT.
 Where `pc status` only answers "is sshd reachable", `pc ping` separates
 "the PC is off" from "the PC is up but sshd is down".
 
+### `ota`
+
+A/B firmware update with signature verification and automatic rollback; the
+mechanism is described in
+[recovery-access-architecture.md](recovery-access-architecture.md#over-the-air-updates).
+
+| Form | What it does |
+|---|---|
+| `ssh user@board ota < firmware-signed.bin` | upload the image over the SSH connection (non-interactive mode) |
+| `ota https://host/path/firmware-signed.bin` | the board downloads the image itself (HTTPS only, redirects followed) |
+| `ota status` | running/next slot, both slots' state and image, self-test state, last OTA event |
+| `ota rollback yes` | boot the other slot's image (if it holds a valid one) |
+| `ota` / `help ota` | usage |
+
+A successful update ends like this, then the connection closes and the board
+reboots:
+
+```text
+  1725 KB received, verifying ...
+
+verified 1.2.0 (1725 KB, IDF 5.5.5) written to app1
+Current v1.1.0 stays in the other slot as fallback. Rebooting in 3 s - reconnect in ~15 s;
+the new image confirms itself once Wi-Fi + SSH are up, otherwise the bootloader rolls back.
+```
+
+A rejected image never changes anything and exits with status 1:
+
+```text
+Rejected: signature check FAILED - image is not signed with this firmware's release key
+(version field: '1.2.0'). Nothing was changed.
+```
+
+`ota status` after a successful update and self-test:
+
+```text
+Running: app1 (v1.2.0)   Next boot: app1
+  app0  @ 0x010000   6400 KB  valid          image present, IDF 5.5.5
+  app1  @ 0x650000   6400 KB  valid          image present, IDF 5.5.5
+Self-test: confirmed
+Last OTA event: v1.2.0 passed self-test after 2 s, image confirmed (ESP_OK)
+```
+
+The last OTA event survives the reboot (it is kept in NVS), so after an
+automatic rollback the same command explains what happened:
+`v1.3.0 FAILED self-test (wifi=1 service=0) - rolled back to the previous image`.
+
 ### `reboot`
 
 ```text
@@ -317,7 +393,11 @@ Implemented:
   tunnel just closes silently (it's a raw relay, not a text channel).
   Either way the server goes back to accepting connections right after.
 - An unknown command isn't executed and points the user to `help`.
-- `reboot` requires an explicit `reboot yes`.
+- `reboot` requires an explicit `reboot yes`; `ota rollback` requires
+  `ota rollback yes`.
+- OTA images are accepted only with a valid Ed25519 signature from the
+  release key compiled into the firmware; the download form accepts only
+  `https://` URLs validated against the public CA bundle.
 
 Planned:
 

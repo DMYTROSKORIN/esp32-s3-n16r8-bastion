@@ -4,6 +4,7 @@
 #include <SPIFFS.h>
 #include <WiFi.h>
 #include <esp_heap_caps.h>
+#include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <libssh/libssh.h>
@@ -20,6 +21,7 @@
 #include "firmware_info.h"
 #include "main_pc.h"
 #include "net_monitor.h"
+#include "ota_update.h"
 #include "recovery_status.h"
 #include "recovery_vpn.h"
 
@@ -87,11 +89,18 @@ constexpr char kAnsiGreen[] = "\x1b[32m";
 constexpr char kAnsiYellow[] = "\x1b[33m";
 constexpr char kAnsiRed[] = "\x1b[31m";
 constexpr char kAnsiCyan[] = "\x1b[36m";
+constexpr char kAnsiWhite[] = "\x1b[97m";
+constexpr char kAnsiBoldWhite[] = "\x1b[1;97m";
+constexpr char kAnsiBoldYellow[] = "\x1b[1;33m";
+constexpr char kAnsiBoldCyan[] = "\x1b[1;36m";
 constexpr char kPrompt[] = "\x1b[1;32mrecovery>\x1b[0m ";
 constexpr char kClearScreen[] = "\x1b[2J\x1b[H";
 
 ssh_key authorizedKey = nullptr;
 char authorizedKeyFingerprint[64] = "unknown";
+// Columns reported by the client's pty-req / window-change; the dashboard
+// draws its rules to this width (clamped) instead of a fixed 48 columns.
+std::atomic<int> terminalColumns{80};
 uint8_t* relayToPc = nullptr;
 uint8_t* relayToClient = nullptr;
 std::atomic<uint32_t> sessionsServed{0};
@@ -199,10 +208,41 @@ void formatUptime(char* output, size_t outputSize) {
                  outputSize);
 }
 
+// A horizontal rule as wide as the client's terminal (clamped to 48..100).
+void writeRule(ssh_channel channel) {
+  int width = terminalColumns.load() - 2;
+  width = width < 48 ? 48 : (width > 100 ? 100 : width);
+  char line[3 * 100 + 8];  // "─" is 3 bytes in UTF-8.
+  size_t used = 0;
+  line[used++] = ' ';
+  line[used++] = ' ';
+  for (int i = 0; i < width; ++i) {
+    memcpy(line + used, "\xe2\x94\x80", 3);
+    used += 3;
+  }
+  line[used++] = '\r';
+  line[used++] = '\n';
+  line[used] = '\0';
+  channelPrintf(channel, "%s%s%s", kAnsiDim, line, kAnsiReset);
+}
+
+// One dashboard row: cyan label, coloured ● + state, then the detail text.
+// Details use bright white for the facts you act on (addresses, names) and
+// the default colour for context; nothing important is dimmed.
 void statusRow(ssh_channel channel, const char* label, const char* color,
                const char* state, const char* detail) {
-  channelPrintf(channel, "  %-10s %s● %-9s%s %s\r\n", label, color, state,
-                kAnsiReset, detail != nullptr ? detail : "");
+  channelPrintf(channel, "  %s%-10s%s %s\xe2\x97\x8f %-10s%s %s\r\n", kAnsiCyan, label,
+                kAnsiReset, color, state, kAnsiReset, detail != nullptr ? detail : "");
+}
+
+const char* resetReasonColor(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:
+    case ESP_RST_SW:
+      return kAnsiGreen;
+    default:
+      return kAnsiRed;  // panic, watchdogs, brownout: worth noticing.
+  }
 }
 
 void writeDashboard(ssh_channel channel) {
@@ -216,32 +256,45 @@ void writeDashboard(ssh_channel channel) {
   const bool vpnOnline = recoveryVpnOnline();
   const uint32_t handshakeAge = recoveryVpnHandshakeAgeSeconds();
   const uint8_t vpnFailures = recoveryVpnConsecutiveFailures();
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  const int rssi = WiFi.RSSI();
 
-  char detail[160];
+  char detail[200];
+  // Header: title, version highlighted on its own, board, reset reason
+  // coloured by whether it was expected.
   channelPrintf(channel,
-                "\r\n  %sESP32 Recovery Gateway%s  %s%s v%s · %s%s\r\n"
-                "  ────────────────────────────────────────────────\r\n",
-                kAnsiBold, kAnsiReset, kAnsiDim, FIRMWARE_TARGET_BOARD,
-                FIRMWARE_VERSION, resetReasonName(esp_reset_reason()), kAnsiReset);
+                "\r\n  %sESP32 Recovery Gateway%s   %sv%s%s   %s%s%s  %s\xe2\x80\xa2 reset: %s%s\r\n",
+                kAnsiBoldWhite, kAnsiReset, kAnsiBoldYellow, FIRMWARE_VERSION, kAnsiReset,
+                kAnsiDim, FIRMWARE_TARGET_BOARD, kAnsiReset, resetReasonColor(resetReason),
+                resetReasonName(resetReason), kAnsiReset);
+  writeRule(channel);
 
-  snprintf(detail, sizeof(detail), "%suptime %s%s", kAnsiDim, uptime, kAnsiReset);
+  snprintf(detail, sizeof(detail), "up %s%s%s", kAnsiWhite, uptime, kAnsiReset);
   statusRow(channel, "Device", kAnsiGreen, "ONLINE", detail);
 
-  snprintf(detail, sizeof(detail), "%s  %s%d dBm  up %s%s", WiFi.SSID().c_str(),
-           kAnsiDim, WiFi.RSSI(), wifiUptime, kAnsiReset);
+  if (wifiOnline) {
+    const char* rssiColor = rssi > -67 ? kAnsiGreen : (rssi > -75 ? kAnsiYellow : kAnsiRed);
+    snprintf(detail, sizeof(detail), "%s%s%s  %s%d dBm%s  ch %d  ip %s%s%s  up %s",
+             kAnsiBoldWhite, WiFi.SSID().c_str(), kAnsiReset, rssiColor, rssi, kAnsiReset,
+             WiFi.channel(), kAnsiWhite, WiFi.localIP().toString().c_str(), kAnsiReset,
+             wifiUptime);
+  }
   statusRow(channel, "Wi-Fi", wifiOnline ? kAnsiGreen : kAnsiRed,
-            wifiOnline ? "ONLINE" : "OFFLINE", wifiOnline ? detail : nullptr);
+            wifiOnline ? "ONLINE" : "OFFLINE", wifiOnline ? detail : "");
 
   statusRow(channel, "Internet", internetOnline ? kAnsiGreen : kAnsiRed,
-            internetOnline ? "ONLINE" : "OFFLINE", nullptr);
+            internetOnline ? "ONLINE" : "OFFLINE", "");
 
   if (handshakeAge != UINT32_MAX) {
-    snprintf(detail, sizeof(detail), "%s  %s%s  %shandshake %lus ago%s",
-             recoveryVpnActiveProfileName(),
-             recoveryVpnAddress().toString().c_str(), kAnsiReset, kAnsiDim,
-             static_cast<unsigned long>(handshakeAge), kAnsiReset);
+    snprintf(detail, sizeof(detail), "%s%s%s  %s%s%s  handshake %lu s ago", kAnsiBoldWhite,
+             recoveryVpnActiveProfileName(), kAnsiReset, kAnsiWhite,
+             recoveryVpnAddress().toString().c_str(), kAnsiReset,
+             static_cast<unsigned long>(handshakeAge));
+  } else if (recoveryVpnConfigured()) {
+    snprintf(detail, sizeof(detail), "%s%s%s  %s", kAnsiBoldWhite,
+             recoveryVpnActiveProfileName(), kAnsiReset, recoveryVpnEndpoint());
   } else {
-    snprintf(detail, sizeof(detail), "%s", recoveryVpnActiveProfileName());
+    snprintf(detail, sizeof(detail), "no profiles provisioned");
   }
   statusRow(channel, "WireGuard", vpnOnline ? kAnsiGreen : kAnsiYellow,
             recoveryVpnStateName(), detail);
@@ -251,34 +304,43 @@ void writeDashboard(ssh_channel channel) {
     statusRow(channel, "VPN errors", kAnsiRed, "FAILING", detail);
   }
 
-  snprintf(detail, sizeof(detail), "%s  %sssh :%u %s%s", gDeviceConfig.pcIp,
-           kAnsiDim, gDeviceConfig.pcPort, pcOnline ? "open" : "closed",
-           kAnsiReset);
+  snprintf(detail, sizeof(detail), "%s%s:%u%s  ssh %s%s%s", kAnsiBoldWhite,
+           gDeviceConfig.pcIp, gDeviceConfig.pcPort, kAnsiReset,
+           pcOnline ? kAnsiGreen : kAnsiRed, pcOnline ? "open" : "closed", kAnsiReset);
   statusRow(channel, "Main PC", pcOnline ? kAnsiGreen : kAnsiRed,
             pcOnline ? "ONLINE" : "OFFLINE", detail);
 
   char mac[24];
   mainPcMacString(mac, sizeof(mac));
-  snprintf(detail, sizeof(detail), "%s%s%s", kAnsiDim, mac, kAnsiReset);
+  snprintf(detail, sizeof(detail), "%s%s%s", kAnsiWhite, mac, kAnsiReset);
   statusRow(channel, "WoWLAN",
             pcOnline ? kAnsiDim : (mainPcMacKnown() ? kAnsiGreen : kAnsiYellow),
-            pcOnline ? "STANDBY" : (mainPcMacKnown() ? "READY" : "NO MAC"),
-            detail);
+            pcOnline ? "STANDBY" : (mainPcMacKnown() ? "READY" : "NO MAC"), detail);
 
-  channelPrintf(channel,
-                "  %-10s   %sheap %u KB (min %u KB)  psram %u/%u KB  sessions %lu%s\r\n",
-                "Memory", kAnsiDim,
-                static_cast<unsigned>(ESP.getFreeHeap() / 1024),
-                static_cast<unsigned>(ESP.getMinFreeHeap() / 1024),
-                static_cast<unsigned>(ESP.getFreePsram() / 1024),
-                static_cast<unsigned>(ESP.getPsramSize() / 1024),
-                static_cast<unsigned long>(sessionsServed.load()), kAnsiReset);
+  const unsigned heapKb = static_cast<unsigned>(ESP.getFreeHeap() / 1024);
+  const unsigned heapMinKb = static_cast<unsigned>(ESP.getMinFreeHeap() / 1024);
+  const char* heapColor = heapMinKb >= 80 ? kAnsiGreen : (heapMinKb >= 50 ? kAnsiYellow : kAnsiRed);
+  snprintf(detail, sizeof(detail), "heap %s%u KB%s (min %u)  psram %u/%u KB", kAnsiWhite,
+           heapKb, kAnsiReset, heapMinKb, static_cast<unsigned>(ESP.getFreePsram() / 1024),
+           static_cast<unsigned>(ESP.getPsramSize() / 1024));
+  statusRow(channel, "Memory", heapColor,
+            heapMinKb >= 80 ? "OK" : (heapMinKb >= 50 ? "TIGHT" : "LOW"), detail);
 
+  const bool selfTest = otaSelfTestPending();
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  snprintf(detail, sizeof(detail), "slot %s%s%s  sessions %lu  %s", kAnsiWhite,
+           running != nullptr ? running->label : "?", kAnsiReset,
+           static_cast<unsigned long>(sessionsServed.load()),
+           selfTest ? "confirming this image (Wi-Fi + SSH up) ..." : "");
+  statusRow(channel, "Firmware", selfTest ? kAnsiYellow : kAnsiGreen,
+            selfTest ? "SELF-TEST" : "CONFIRMED", detail);
+
+  writeRule(channel);
   channelPrintf(channel,
-                "  ────────────────────────────────────────────────\r\n"
-                "  %shelp%s commands   %spc ssh%s how to reach the PC   %spc wake%s wake it up\r\n\r\n",
-                kAnsiCyan, kAnsiReset, kAnsiCyan, kAnsiReset, kAnsiCyan,
-                kAnsiReset);
+                "  %shelp%s commands   %spc ssh%s reach the PC   %spc wake%s wake it up   "
+                "%sota%s update\r\n\r\n",
+                kAnsiBoldCyan, kAnsiReset, kAnsiBoldCyan, kAnsiReset, kAnsiBoldCyan,
+                kAnsiReset, kAnsiBoldCyan, kAnsiReset);
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +372,7 @@ bool cmdVpnStatus(ssh_channel channel, const char*);
 bool cmdVpnFailover(ssh_channel channel, const char*);
 bool cmdVpnRetryPrimary(ssh_channel channel, const char*);
 bool cmdReboot(ssh_channel channel, const char* args);
+bool cmdOta(ssh_channel channel, const char* args);
 bool cmdExit(ssh_channel channel, const char*);
 
 // Longest names first within a group so "pc status" is matched before "pc".
@@ -351,6 +414,18 @@ const Command kCommands[] = {
      "Type `reboot yes` to skip the confirmation prompt.\r\n"
      "Provisioned settings are kept; only the current session ends.\r\n",
      cmdReboot},
+    {"ota", "DEVICE", "Firmware update: ota status | ota <https-url> | ota rollback yes",
+     "A/B firmware update into the inactive slot, verified by Ed25519 release\r\n"
+     "signature and ESP-IDF image check, with automatic rollback if the new\r\n"
+     "image does not bring up Wi-Fi + SSH within 2 minutes.\r\n\r\n"
+     "  ota status                 slots, versions, self-test state\r\n"
+     "  ota https://.../firmware-signed.bin\r\n"
+     "                             the board downloads and applies the image\r\n"
+     "  ota rollback yes           boot the other slot's image\r\n\r\n"
+     "Upload from your machine instead (no internet needed on the board):\r\n"
+     "  ssh <user>@<board> ota < firmware-signed.bin\r\n"
+     "Settings, WireGuard profiles and the host key are untouched.\r\n",
+     cmdOta},
     {"help", "HELP", "Show this command list; `help <command>` for details",
      nullptr, cmdHelp},
     {"exit", "HELP", "Close the SSH session (also: quit, logout)", nullptr, cmdExit},
@@ -649,6 +724,149 @@ bool cmdReboot(ssh_channel channel, const char* args) {
   return false;
 }
 
+bool executeCommand(ssh_channel channel, String command);
+
+void otaReportToChannel(const char* line, void* userData) {
+  channelPrintf(static_cast<ssh_channel>(userData), "%s\r\n", line);
+}
+
+// Prints the outcome, closes the channel cleanly and reboots into the new
+// image. Never returns.
+void finishOtaAndReboot(ssh_channel channel, const OtaResult& result) {
+  channelPrintf(channel,
+                "\r\n%s\r\nCurrent v%s stays in the other slot as fallback. "
+                "Rebooting in 3 s - reconnect in ~15 s; the new image confirms itself "
+                "once Wi-Fi + SSH are up, otherwise the bootloader rolls back.\r\n",
+                result.message, FIRMWARE_VERSION);
+  eventLogf("OTA: rebooting into %s (v%s) requested by %s", result.targetLabel,
+            result.version, peerAddress);
+  ssh_channel_request_send_exit_status(channel, 0);
+  ssh_channel_send_eof(channel);
+  ssh_channel_close(channel);
+  delay(3000);
+  ESP.restart();
+}
+
+bool cmdOta(ssh_channel channel, const char* args) {
+  if (*args == '\0' || strcmp(args, "help") == 0) {
+    const char* rest = nullptr;
+    const Command* self = findCommand("ota", &rest);
+    channelPrintf(channel, "\r\n%s - %s\r\n\r\n%s", self->name, self->summary, self->detail);
+    return true;
+  }
+  if (strcmp(args, "status") == 0) {
+    char text[640];
+    otaDescribeSlots(text, sizeof(text));
+    channelPrintf(channel, "\r\n%s", text);
+    return true;
+  }
+  if (strncmp(args, "rollback", 8) == 0) {
+    if (strcmp(args, "rollback yes") != 0) {
+      channelWrite(channel, "\r\nBoot the other slot's image? Type `ota rollback yes`.\r\n");
+      return true;
+    }
+    char message[128];
+    if (!otaRollback(message, sizeof(message))) {
+      channelPrintf(channel, "\r\nRollback not possible: %s\r\n", message);
+      return true;
+    }
+    channelPrintf(channel, "\r\n%s\r\n", message);
+    ssh_channel_send_eof(channel);
+    ssh_channel_close(channel);
+    delay(1500);
+    ESP.restart();
+    return false;
+  }
+  if (strncmp(args, "https://", 8) == 0) {
+    channelPrintf(channel, "\r\nFetching %s\r\n", args);
+    eventLogf("OTA: download requested by %s", peerAddress);
+    OtaResult result;
+    if (!otaFromUrl(args, otaReportToChannel, channel, result)) {
+      channelPrintf(channel, "\r\nUpdate failed: %s\r\nThe running firmware is unchanged.\r\n",
+                    result.message);
+      return true;
+    }
+    finishOtaAndReboot(channel, result);
+    return false;
+  }
+  channelWrite(channel,
+               "\r\nUsage: ota status | ota https://<url> | ota rollback yes\r\n"
+               "Upload: ssh <user>@<board> ota < firmware-signed.bin\r\n");
+  return true;
+}
+
+// `ssh user@board ota < firmware-signed.bin`: the image arrives as the exec
+// channel's stdin. Streams into the inactive slot; the client sees progress
+// on stdout and a non-zero exit status on failure.
+void receiveOtaFromChannel(ssh_channel channel) {
+  constexpr uint32_t kUploadIdleTimeoutMs = 60000;
+  eventLogf("OTA: upload over SSH from %s", peerAddress);
+  OtaSink sink;
+  OtaResult result;
+  if (!sink.begin(result)) {
+    channelPrintf(channel, "OTA cannot start: %s\r\n", result.message);
+    ssh_channel_request_send_exit_status(channel, 1);
+    return;
+  }
+  channelPrintf(channel, "Receiving image into %s ...\r\n", result.targetLabel);
+  uint32_t lastDataMs = millis();
+  size_t lastReported = 0;
+  while (true) {
+    const int count = ssh_channel_read_timeout(channel, relayToPc, kRelayBufferSize, 0, 1000);
+    if (count == SSH_ERROR) {
+      channelWrite(channel, "Transfer failed (channel error). Nothing was changed.\r\n");
+      sink.abort();
+      ssh_channel_request_send_exit_status(channel, 1);
+      return;
+    }
+    if (count == 0) {
+      if (ssh_channel_is_eof(channel)) {
+        break;
+      }
+      if (millis() - lastDataMs > kUploadIdleTimeoutMs) {
+        channelWrite(channel, "Transfer stalled for 60 s. Nothing was changed.\r\n");
+        sink.abort();
+        ssh_channel_request_send_exit_status(channel, 1);
+        return;
+      }
+      continue;
+    }
+    lastDataMs = millis();
+    if (!sink.feed(relayToPc, static_cast<size_t>(count), result)) {
+      channelPrintf(channel, "Rejected: %s. Nothing was changed.\r\n", result.message);
+      sink.abort();
+      ssh_channel_request_send_exit_status(channel, 1);
+      return;
+    }
+    if (sink.bytesReceived() - lastReported >= 256 * 1024) {
+      lastReported = sink.bytesReceived();
+      channelPrintf(channel, "  %u KB\r\n", static_cast<unsigned>(lastReported / 1024));
+    }
+  }
+  channelPrintf(channel, "  %u KB received, verifying ...\r\n",
+                static_cast<unsigned>(sink.bytesReceived() / 1024));
+  if (!sink.finish(result)) {
+    channelPrintf(channel, "Rejected: %s. Nothing was changed.\r\n", result.message);
+    eventLogf("OTA: upload rejected: %s", result.message);
+    ssh_channel_request_send_exit_status(channel, 1);
+    return;
+  }
+  finishOtaAndReboot(channel, result);
+}
+
+// Non-interactive `ssh user@board <command>`: run one console command, exit.
+void runExecCommand(ssh_channel channel, const String& command) {
+  String trimmed = command;
+  trimmed.trim();
+  if (trimmed == "ota" || trimmed == "ota -" || trimmed == "ota upload") {
+    receiveOtaFromChannel(channel);
+    return;
+  }
+  eventLogf("SSH: exec '%s' from %s", trimmed.c_str(), peerAddress);
+  executeCommand(channel, trimmed);
+  ssh_channel_request_send_exit_status(channel, 0);
+}
+
 bool cmdExit(ssh_channel channel, const char*) {
   channelWrite(channel, "\r\nBye.\r\n");
   return false;
@@ -674,7 +892,10 @@ bool executeCommand(ssh_channel channel, String command) {
                   command.c_str());
     return true;
   }
-  return found->handler(channel, args);
+  // Match case-insensitively, but hand the handler the arguments as typed:
+  // URLs and file names are case-sensitive.
+  const char* originalArgs = command.c_str() + (args - lowered.c_str());
+  return found->handler(channel, originalArgs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,7 +1450,10 @@ void handleAuthenticatedSession(ssh_session session) {
         }
 
         bool shellRequested = false;
-        while (!shellRequested && millis() - startedMs < kPreShellDeadlineMs) {
+        bool execRequested = false;
+        String execCommand;
+        while (!shellRequested && !execRequested &&
+               millis() - startedMs < kPreShellDeadlineMs) {
           ssh_message request = ssh_message_get(session);
           if (request == nullptr) {
             ssh_channel_free(channel);
@@ -1240,10 +1464,21 @@ void handleAuthenticatedSession(ssh_session session) {
             if (requestType == SSH_CHANNEL_REQUEST_PTY ||
                 requestType == SSH_CHANNEL_REQUEST_ENV ||
                 requestType == SSH_CHANNEL_REQUEST_WINDOW_CHANGE) {
+              if (requestType != SSH_CHANNEL_REQUEST_ENV) {
+                const int columns = ssh_message_channel_request_pty_width(request);
+                if (columns > 0) {
+                  terminalColumns = columns;
+                }
+              }
               ssh_message_channel_request_reply_success(request);
             } else if (requestType == SSH_CHANNEL_REQUEST_SHELL) {
               ssh_message_channel_request_reply_success(request);
               shellRequested = true;
+            } else if (requestType == SSH_CHANNEL_REQUEST_EXEC) {
+              const char* commandText = ssh_message_channel_request_command(request);
+              execCommand = commandText != nullptr ? commandText : "";
+              ssh_message_channel_request_reply_success(request);
+              execRequested = true;
             } else {
               ssh_message_reply_default(request);
             }
@@ -1255,6 +1490,8 @@ void handleAuthenticatedSession(ssh_session session) {
         if (shellRequested) {
           eventLogf("SSH: console session from %s", peerAddress);
           serveShell(channel);
+        } else if (execRequested) {
+          runExecCommand(channel, execCommand);
         }
         ssh_channel_close(channel);
         ssh_channel_free(channel);
@@ -1373,6 +1610,7 @@ void sshServerTask(void*) {
   eventLogf("SSH: listening on %s:%s as %s (key %s)",
             WiFi.localIP().toString().c_str(), kBindPort, gDeviceConfig.sshUser,
             authorizedKeyFingerprint);
+  otaNoteServiceUp();
 
   // ssh_bind_accept() failing over and over (rather than just once, which is
   // routine for a dropped/reset peer) means the listening socket itself has

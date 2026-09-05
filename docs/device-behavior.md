@@ -176,6 +176,18 @@ The device is meant to sit unattended for months, so it watches itself:
   run from a marginal supply can restore modem-sleep with
   `-DBASTION_WIFI_POWER_SAVE=1`; the boot log then says so.
 
+## Firmware updates
+
+The board updates itself over the air (`ota` in the SSH console, or
+`ssh user@board ota < firmware-signed.bin`). The new image is written to the
+inactive flash slot, verified, and booted; for its first two minutes the
+dashboard's `Firmware` row shows `SELF-TEST` in yellow, then `CONFIRMED`
+once Wi-Fi and SSH are up. If the new image does not get that far, the
+board reboots into the previous firmware by itself. Nothing you provisioned
+is touched by an update. The LED shows the normal boot sequence during this
+(blue breathing, then green); a rollback looks like one extra reboot about
+two minutes after the update. Details in the architecture document.
+
 ## Recovery VPN and SSH console
 
 Three more subsystems run alongside the LED indication (details in

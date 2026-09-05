@@ -12,6 +12,7 @@
 #include "event_log.h"
 #include "firmware_info.h"
 #include "net_monitor.h"
+#include "ota_update.h"
 #include "recovery_ssh.h"
 #include "recovery_vpn.h"
 #include "setup_portal.h"
@@ -416,6 +417,11 @@ void setup() {
 #endif
   esp_task_wdt_add(nullptr);
 
+  // If this is the first boot of a freshly installed OTA image, start the
+  // self-test now; it confirms the image once Wi-Fi + SSH (or the portal)
+  // are up, or lets the bootloader roll back.
+  otaSelfTestStart();
+
   deviceConfigLoad();
   const bool editRequested = portalRequestFlagTake();
 
@@ -425,6 +431,7 @@ void setup() {
   if (!deviceConfigPresent() || editRequested) {
     deviceMode = DeviceMode::kSetup;
     setupPortalStart();
+    otaNoteServiceUp();
     eventLogf("State: SETUP");
     return;
   }
