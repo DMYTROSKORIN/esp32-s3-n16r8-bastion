@@ -1,0 +1,48 @@
+name: Build firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    name: PlatformIO build (esp32-s3-n16r8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build
+        run: pio run -e esp32-s3-n16r8
+
+      - name: Report size
+        run: |
+          ls -l .pio/build/esp32-s3-n16r8/firmware.bin
+          pio run -e esp32-s3-n16r8 -t size 2>/dev/null | tail -n 5 || true
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-s3-n16r8-bastion-${{ github.sha }}
+          path: |
+            .pio/build/esp32-s3-n16r8/firmware.bin
+            .pio/build/esp32-s3-n16r8/bootloader.bin
+            .pio/build/esp32-s3-n16r8/partitions.bin
+          if-no-files-found: error

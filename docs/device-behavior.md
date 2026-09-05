@@ -1,5 +1,9 @@
 # LED indication and device behavior
 
+This document describes the **ESP32-S3-N16R8** firmware (16 MB flash, 8 MB
+PSRAM, DevKitC-1 class board with a WS2812 RGB LED on GPIO 48 and the `BOOT`
+button on GPIO 0).
+
 A single onboard RGB LED shows everything needed to bring the ESP32-S3 up
 and diagnose it without a computer or a serial monitor. Color reports the
 current state, and the flash pattern distinguishes normal operation from a
@@ -34,8 +38,8 @@ without opening the SSH console.
 The edges of every flash (green and violet) are softened slightly in
 software (~20 ms rise/fall) — this isn't a hardware feature of the LED, it's
 an intermediate-brightness calculation on every iteration of the main loop
-(nominally every ~5 ms, though a network state check can occasionally
-stretch one iteration by up to ~1-2 s while a check host is unreachable).
+(every ~5 ms; since 1.0.0 nothing that can block on the network runs on the
+loop task, so the animation no longer stutters during reachability probes).
 The blink pattern itself stays crisp and easy to
 read; the smoothing only affects the short flash edges and the full smooth
 breathing in the `CONNECTING` state. Alert signals (fast red blinking, amber
@@ -98,7 +102,12 @@ The `BOOT` button has two hold thresholds:
    on first boot.
 
 Do not hold `BOOT` while powering on or during a hardware reset — the ESP32
-may instead enter the system firmware-download mode.
+may instead enter the system firmware-download mode. For the same reason a
+`BOOT` level that is already low when the firmware starts is ignored: the
+hold timers only start from a press that begins after boot. This also stops
+the USB-serial auto-reset circuit (esptool, an attached serial monitor), which
+holds GPIO0 low for a while after a reset, from being mistaken for a 5 s or
+10 s hold.
 
 ## State machine
 
@@ -140,11 +149,39 @@ A successful TCP connection to at least one server is enough for `ONLINE`
 both servers are unreachable, the ESP32 switches to `NO_INTERNET`. Once
 access is restored, the device automatically returns to `ONLINE`.
 
+## Self-supervision: watchdog and automatic restart
+
+The device is meant to sit unattended for months, so it watches itself:
+
+- **Task watchdog, 60 s.** The main loop and the network-monitor task feed a
+  hardware-backed task watchdog. Both are written so that no single
+  iteration legitimately takes more than a few seconds (the longest, the
+  15 s Wi-Fi trial in the setup portal, feeds the watchdog from inside its
+  wait loop). If either stops feeding it, the chip reboots and the next
+  dashboard shows `task-watchdog` as the reset reason; `logs` then shows
+  what preceded it.
+- **10 minutes without Wi-Fi → restart.** The LED keeps breathing blue
+  while the firmware retries the saved network every 10 s; if the radio has
+  not associated for 10 minutes straight, the device restarts to re-run
+  every initialisation path from scratch. Wi-Fi being up but the *internet*
+  being down (fast red blinking) never triggers a restart.
+- **Boot counter and reset reason.** Every boot increments a counter in NVS
+  and logs the reason for the previous reset (`power-on`, `software`,
+  `panic`, `task-watchdog`, `brownout`, ...). A rising count of `brownout`
+  resets points at the power supply, not the firmware.
+- **Wi-Fi radio stays awake.** Modem power-save is disabled for the lowest
+  latency and steady throughput (the board is USB-powered). Builds that must
+  run from a marginal supply can restore modem-sleep with
+  `-DBASTION_WIFI_POWER_SAVE=1`; the boot log then says so.
+
 ## Recovery VPN and SSH console
 
-Two more subsystems run alongside the LED indication (details in
+Three more subsystems run alongside the LED indication (details in
 [recovery-access-architecture.md](recovery-access-architecture.md)):
 
+- The **network monitor** task owns Wi-Fi reconnects, the internet
+  reachability probe and learning the PC's MAC address, so the main loop
+  only animates the LED and times the `BOOT` button.
 - The **SSH server** starts once connected to Wi-Fi and listens on port 22
   on all interfaces — it is reachable from the local network and through the
   WireGuard tunnel. Login is by authorized public key only.
@@ -154,10 +191,11 @@ Two more subsystems run alongside the LED indication (details in
   `1.1.1.1:53` / `8.8.8.8:53` **through the tunnel**. After three
   consecutive failures the board automatically switches to the failover
   server.
-- The serial log (115200 baud) records VPN state transitions
-  (`WireGuard: profile 1 is online`, `health check failed (n/3)`,
-  `failing over to …`) — the first place to look when diagnosing tunnel
-  issues.
+- The serial log (115200 baud) and the in-memory journal (`logs` over SSH)
+  record the same events with uptime stamps: Wi-Fi disconnect reasons,
+  `Net:` state changes, VPN transitions (`WireGuard: profile 1 is online`,
+  `health check failed (n/3)`, `failing over to …`), SSH logins and relay
+  statistics — the first place to look when diagnosing anything.
 
 Note: the "internet for LED indication" check (`8.8.8.8:53`, `8.8.4.4:53`)
 is a separate mechanism from the VPN health check; once the tunnel is up,
@@ -172,6 +210,8 @@ both checks run through WireGuard.
 - The main PC's MAC address isn't entered manually — it's learned
   automatically via ARP the first time the PC appears on the network, and is
   also cached in NVS.
+- The same namespace holds a boot counter and the one-shot "reopen the
+  portal" flag set by a 5 s `BOOT` hold; a factory reset clears all of it.
 - The firmware gets its IP address via DHCP.
 - A stable local address, if needed, is pinned on the router via a DHCP
   reservation rather than hardcoded into the firmware.
@@ -187,6 +227,15 @@ both checks run through WireGuard.
   reach the internet. Check the internet uplink and network rules for
   `8.8.8.8:53` and `8.8.4.4:53`.
 - **Double green:** the device is operating normally.
+- **Device rebooted on its own:** open the SSH console; the dashboard header
+  shows the reset reason and `logs` the last events before it. `brownout`
+  means the USB supply dipped; `task-watchdog` means a task hung and the
+  watchdog recovered the board.
+- **Console feels laggy / btop stutters over VPN:** expected to a degree —
+  the TCP window of the ESP32's network stack caps a single connection at
+  roughly 5760 bytes per round-trip (see "SSH throughput" in the
+  architecture document). Over the LAN the session should be snappy; if it
+  is not, check RSSI with `net status`.
 - **WoWLAN doesn't wake the PC:** the console shows `NO MAC` on the `WoWLAN`
   line as long as the PC hasn't been seen on the network yet since
   setup/reset — power it on manually once, and the MAC will be remembered

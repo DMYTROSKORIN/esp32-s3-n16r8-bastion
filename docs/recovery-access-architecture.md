@@ -21,6 +21,26 @@ Linux PC 192.168.1.200:22
           └── diagnose and restart the main WireGuard tunnel
 ```
 
+## Target hardware: ESP32-S3-N16R8
+
+The firmware is built for, tested on and only supported on the
+**ESP32-S3-N16R8** module - an ESP32-S3 with 16 MB quad-SPI flash and 8 MB
+octal-SPI PSRAM (DevKitC-1 class boards with the onboard WS2812 RGB LED on
+GPIO 48 and the `BOOT` button on GPIO 0). Everything below that touches
+memory or flash layout assumes exactly that part:
+
+| Resource | How it is used |
+|---|---|
+| 16 MB flash, QIO @ 80 MHz | `default_16MB.csv`: two 6.25 MB OTA app slots (`app0`/`app1`), 3.4 MB SPIFFS (SSH host key), 64 KB coredump, NVS at 0x9000 (provisioned settings, learned MAC, boot counter). The stock `default_8MB.csv` of the DevKitC-1 board definition would waste half the chip. |
+| 8 MB PSRAM, OPI @ 80 MHz | `board_build.arduino.memory_type = qio_opi`; `heap_caps_malloc_extmem_enable(512)` sends every allocation of 512 B or more to PSRAM, which is what keeps libssh's per-packet buffers from fragmenting the ~320 KB of internal RAM under sustained traffic. The event journal (28 KB) lives there too. Internal RAM is reserved for what must be fast: task stacks, lwIP/Wi-Fi buffers, the two 8 KB relay buffers. |
+| CPU 240 MHz, dual core | Core 0: Wi-Fi driver, lwIP `tcpip_thread`, SSH server task. Core 1: Arduino loop (LED, button, watchdog feed), `net-monitor`, `recovery-vpn`. |
+| Hardware AES / SHA / MPI | mbedTLS uses the S3's accelerators for AES (all SSH ciphers offered), SHA-256/512 (MACs, KEX hashes) and big-number math (ECDH). chacha20-poly1305 is not part of this libssh/mbedTLS build (the Arduino core omits mbedTLS's CHACHAPOLY module) and is not offered - see "SSH throughput" below. |
+
+The boot banner prints what it actually found (`flash 16 MB QIO @ 80 MHz |
+PSRAM 8189 KB`) and logs a `WARNING` if the PSRAM or flash size does not
+match the N16R8, because the most likely symptom of a mismatch (libssh
+allocations failing) would otherwise look like a random network bug.
+
 ## Status indication (RGB LED)
 
 Besides the SSH console, the device reports its state through a single
@@ -107,7 +127,8 @@ Notes on the SSH client:
 - On first connection the client asks about the host key twice: first the
   VPN server's key (the jump host), then the board's key. The board's key is
   unique, generated on first boot, and stored in SPIFFS — it survives
-  reflashing.
+  reflashing (with one exception: upgrading from a pre-1.0.0 build moves the
+  SPIFFS partition, so the key is regenerated exactly once).
 - OpenSSH 10+ prints a warning about the missing post-quantum key exchange:
   LibSSH-ESP32 doesn't support it yet. The risk is minimal — the SSH traffic
   already runs inside WireGuard with a `PresharedKey`, which gives the
@@ -151,22 +172,25 @@ colors: a green/yellow/red ● indicator per line, gray secondary details,
 cyan command hints):
 
 ```text
-  ESP32 Recovery Gateway
+  ESP32 Recovery Gateway  ESP32-S3-N16R8 v1.0.0 · power-on
   ────────────────────────────────────────────────
   Device     ● ONLINE    uptime 0d 00:07:44
-  Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm
+  Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm  up 0d 00:07:39
   Internet   ● ONLINE
   WireGuard  ● ONLINE    profile-1  10.66.0.2  handshake 10s ago
   Main PC    ● ONLINE    192.168.1.200  ssh :22 open
   WoWLAN     ● STANDBY   AA:BB:CC:DD:EE:FF
-  Memory       heap 199 KB  psram 8166 KB  reset: power-on
+  Memory       heap 196 KB (min 171 KB)  psram 8034/8189 KB  sessions 3
   ────────────────────────────────────────────────
   help commands   pc ssh how to reach the PC   pc wake wake it up
 ```
 
-The `VPN errors` line only appears after consecutive health-check failures.
-`WoWLAN` shows `READY` when the main PC is offline and can be woken, and
-`STANDBY` once the PC is already online.
+The header carries the board, firmware version and the reason for the last
+reset. The `VPN errors` line only appears after consecutive health-check
+failures. `WoWLAN` shows `READY` when the main PC is offline and can be
+woken, and `STANDBY` once the PC is already online. `Memory` shows the free
+internal heap with its low-water mark since boot, free/total PSRAM and the
+number of SSH sessions authenticated since boot.
 
 ### SSH server robustness
 
@@ -186,9 +210,80 @@ Implemented limits (`src/recovery_ssh.cpp`):
 | Auth message limit | 16 | endless authentication brute-forcing |
 | Interactive console idle timeout | 10 min | a session left open and forgotten |
 | PC TCP tunnel idle timeout | 10 min with no traffic | a stuck forwarded channel |
+| Relay write stall | 30 s without progress in either direction | a client or PC that stopped reading but keeps the TCP connection up |
+| Non-blocking connect to the PC | 2 s | the PC's sshd is down: the channel is refused promptly instead of hanging the session |
 
 After any error or timeout the server is guaranteed to go back to `accept`
 and take the next session.
+
+### SSH throughput on the ESP32-S3
+
+Where the bytes of a `btop` session actually go, and what bounds them:
+
+```text
+PC ──TCP──▶ ESP32 lwIP rx (5760 B window) ──▶ relay buffer (8 KB) ──▶ libssh encrypt (AES, hw)
+        ──▶ lwIP tx (5760 B send buffer) ──▶ Wi-Fi ──▶ [WireGuard: chacha20 in software] ──▶ client
+```
+
+What the firmware does to keep that path fast and, above all, stable:
+
+- **Cipher selection.** The server pins `aes128-gcm@openssh.com`,
+  `aes256-gcm@openssh.com`, `aes128-ctr`, `aes256-ctr` with SHA-2 MACs, all of
+  which run on the S3's hardware AES block. `chacha20-poly1305@openssh.com`,
+  the first choice of every stock OpenSSH client, is not available in this
+  libssh/mbedTLS build (the Arduino core does not compile mbedTLS's CHACHAPOLY
+  module; a client forcing it gets `no matching cipher found`), so clients
+  land on AES-GCM with no configuration. The explicit list keeps that true
+  across library upgrades and rules out CBC/3DES. KEX is limited to
+  curve25519 / ECDH-P256 (DH group-exchange is a multi-second modexp on first
+  connect).
+- **`select()`-driven relay.** `relayDirectTcpip()` blocks in `select()` on
+  the SSH socket and a raw lwIP socket to the PC instead of polling both ends
+  every millisecond. A burst is moved in up to 8 KB slices from buffers allocated
+  once in internal RAM. Both sockets have `TCP_NODELAY` (interactive
+  keystrokes and small redraws never wait for Nagle) and TCP keepalive.
+- **Blocking channel writes.** `ssh_channel_write()` runs in blocking mode so
+  the client's SSH window and TCP flow control back-pressure the PC through
+  the relay, instead of libssh buffering output unboundedly (the original
+  `ssh_socket_write: Out of memory` failure under btop). A write that makes
+  no progress for 30 s ends the relay with a journaled reason.
+- **PSRAM for libssh.** Allocations of 512 B and up go to PSRAM; the tiny
+  internal heap no longer fragments under a high packet rate.
+- **Radio awake.** Wi-Fi modem power-save is off (`WIFI_PS_NONE`). Measured
+  on the bench (2026-09-05): idle ICMP RTT to the board 5.6 ms average with
+  the radio awake versus 70 ms average (9-140 ms) with modem-sleep, because
+  every packet after a pause waits for the next beacon. Under sustained load
+  both modes converge (~7-8 ms), so this is about console responsiveness, not
+  bulk throughput. `-DBASTION_WIFI_POWER_SAVE=1` restores modem-sleep for
+  marginal power supplies.
+- **`-O2`.** libssh, the WireGuard stack and the relay are compiled from
+  source; flash is not a constraint on this module.
+
+The remaining ceiling is not in this firmware. lwIP in the prebuilt Arduino
+core has `TCP_WND = TCP_SND_BUF = 5760` bytes, fixed at compile time and not
+adjustable per socket (`ESP_PER_SOC_TCP_WND = 0`). A single TCP connection
+can therefore never have more than 5760 bytes in flight, so its throughput is
+bounded by `5760 B / RTT`:
+
+| Path | Typical RTT | Bound per TCP connection |
+|---|---|---|
+| Same LAN | 2-5 ms | 1.1-2.9 MB/s (CPU/crypto-bound in practice) |
+| Through WireGuard, nearby server | 20-30 ms | 190-290 KB/s |
+| Through WireGuard, far server / mobile | 60-100 ms | 58-96 KB/s |
+
+Measured on the LAN bench (2026-09-05, RSSI -73 dBm, loaded RTT ~7 ms, 2 MB
+through `ssh -J` including key exchange): 129-165 KB/s PC → client and
+83-89 KB/s client → PC, versus 105-123 KB/s and 43-44 KB/s for the previous
+firmware on the same board - identical across AES-GCM and AES-CTR, i.e. the
+link and the window, not the crypto, set the pace. Idle round-trip time to the
+board fell from 74 ms to 6.7 ms with the radio kept awake. A 341 s btop soak
+at 500 ms refresh relayed 14.6 MB with a flat heap and a clean exit. For an interactive terminal - even btop at a high
+refresh rate produces tens of KB/s - this is enough; the earlier session drops were caused by
+unbounded buffering and stall handling, not by the window size. Bulk file
+transfer through the bastion is not a design goal. Raising the window means
+rebuilding the Arduino core libraries with a larger
+`CONFIG_LWIP_TCP_WND_DEFAULT` (ESP-IDF lib builder / pioarduino), which is
+listed under "Open decisions".
 
 Commands:
 
@@ -206,10 +301,10 @@ Commands:
 | `vpn retry-primary` | Force a return to `profile-1` | implemented |
 | `help`, `help <command>` | Help generated from the command registry | implemented |
 | `exit`, `quit`, `logout` | Close the session | implemented |
-| `watch` | Auto-refreshing terminal dashboard | planned |
-| `pc ping` | ICMP check of `192.168.1.200` | planned |
-| `logs` | Recent events from the ring buffer log | planned |
-| `reboot` | Reboot the ESP32 after confirmation | planned |
+| `watch` | Auto-refreshing terminal dashboard (any key stops) | implemented |
+| `pc ping [count]` | ICMP check of the PC's LAN address via `esp_ping` | implemented |
+| `logs [n]` | Recent events from the in-memory journal | implemented |
+| `reboot` | Reboot the ESP32 after `reboot yes` confirmation | implemented |
 
 The TCP tunnel to the PC is implemented as a standard SSH `direct-tcpip`
 channel: the board acts as a jump host (`ssh -J`), and only a single
@@ -218,9 +313,10 @@ destination is rejected.
 
 `help` is part of the interface, not just documentation. The full structure,
 detailed help text, and concrete command examples are documented in
-[cli-reference.md](cli-reference.md). The implementation builds the help text
-from the same command registry that dispatches the handlers, so the text
-cannot drift from what the firmware actually does.
+[cli-reference.md](cli-reference.md). Since 1.0.0 the implementation really
+does build both `help` and `help <command>` from the single `kCommands[]`
+registry that dispatches the handlers, so the text cannot drift from what the
+firmware actually does.
 
 A standard SSH `direct-tcpip` channel is the preferred way to reach the Linux
 PC over plain SSH. It lets the ESP32 act as a jump host without standing up a
@@ -452,8 +548,35 @@ be the right tool then, accepted one-way cost and all.
 
 Implemented:
 
-- independent FreeRTOS tasks for Wi-Fi/LED, internet health, WireGuard, and
-  SSH;
+- independent FreeRTOS tasks: Arduino loop (LED, BOOT button, watchdog feed;
+  core 1), `net-monitor` (Wi-Fi reconnects, internet probe, PC MAC learning;
+  core 1), `recovery-vpn` (WireGuard; core 1) and `recovery-ssh` (core 0).
+  Nothing that can block on the network runs on the loop task any more, so
+  the LED animation and the 5 s / 10 s button classification never stall;
+- a 60 s task watchdog subscribed by the loop and net-monitor tasks. Every
+  iteration of both is bounded to a few seconds by construction (the longest
+  legitimate wait, the portal's 15 s Wi-Fi trial, feeds the watchdog inside
+  its loop), so a timeout means a genuine hang and becomes a clean reboot
+  with `reset: task-watchdog` in the next dashboard;
+- automatic restart after 10 minutes without Wi-Fi association: a radio that
+  stays unassociated that long is almost never coming back by itself (driver
+  wedged after a brownout, DHCP state stuck), and a reboot re-runs every
+  init path from scratch in ~3 s. Loss of *internet* with Wi-Fi still up does
+  not trigger it - that is the ISP's problem, not the board's;
+- an in-memory event journal (`logs`) with uptime stamps: Wi-Fi events with
+  the driver's disconnect reason, `Net:` transitions, VPN transitions, SSH
+  logins with peer address and negotiated algorithms, rejected forwarding
+  requests, relay close reasons with byte counts, and every restart decision;
+- **all `esp_wireguard` calls run on lwIP's `tcpip_thread`** (marshalled with
+  `tcpip_callback()` + a semaphore, see `onLwipThread()` in
+  `recovery_vpn.cpp`). The library calls `netif_add/remove/set_default`, the
+  raw UDP API, `dns_gethostbyname()` and `sys_timeout()` directly; lwIP
+  requires all of those to run on its own thread (core locking is disabled
+  in this Arduino build), and the previous code called them from the VPN
+  task on core 1 while `tcpip_thread` on core 0 was servicing Wi-Fi traffic.
+  All of the wrapped calls are non-blocking (`connect()` reports an
+  in-flight DNS lookup as `ESP_ERR_RETRY`), so the hop costs one context
+  switch and never stalls packet processing;
 - controlled failover between the two VPN profiles (3 failed health checks,
   a 30 s grace period after a profile starts);
 - `PersistentKeepalive = 15` to survive NAT;
@@ -504,8 +627,14 @@ Implemented:
   (`ssh_pki_import_privkey_file`) instead of trusting the mere fact that the
   file exists — an empty/corrupted file used to make `ssh_bind_listen()`
   fail with no regeneration;
-- `ssh_bind_new()` and both `xTaskCreatePinnedToCore` calls (SSH and VPN)
-  are checked for failure and logged;
+- `ssh_bind_new()`, the relay buffer allocations and every
+  `xTaskCreatePinnedToCore` call (SSH, VPN, net-monitor) are checked for
+  failure and logged;
+- a `BOOT` level that is already low when the firmware starts is not treated
+  as a press. GPIO0 doubles as the USB-serial auto-reset line on DevKitC
+  boards, and esptool or an attached monitor holds it low for seconds after
+  a reset; before 1.0.0 that could reboot a freshly flashed board into the
+  setup portal (5 s) or factory-reset it (10 s);
 - `vpn failover`/`vpn retry-primary` requests go through a single
   `std::atomic<VpnRequest>` with `exchange()` instead of two independent
   `volatile bool`s: this is a single-slot mailbox where the last command
@@ -520,17 +649,18 @@ Implemented:
 
 ### Known accepted risks (not fixed, rationale)
 
-- `esp_wireguard`/`wireguardif` (a third-party library) calls raw lwIP APIs
-  (`netif_add/remove/set_default`, the raw UDP API, direct edits to
-  `netif->mtu`) from a user FreeRTOS task on core 1, rather than from
-  `tcpip_thread` and not under the core lock (`CONFIG_LWIP_TCPIP_CORE_LOCKING`
-  is disabled in the SDK in use) — this formally violates lwIP's threading
-  model. Across extensive active testing (dozens of
-  reconnects/failovers/reboots) it has never manifested, but rare races on
-  the `netif` list/UDP PCBs are theoretically possible right at the moment
-  of a failover or Wi-Fi loss under concurrent SSH traffic. A proper fix
-  would mean wrapping every library call through `tcpip_callback` — an
-  invasive rewrite of third-party code that hasn't been undertaken;
+- ~~`esp_wireguard`/`wireguardif` calls raw lwIP APIs from a user task~~ —
+  fixed in 1.0.0: every library call is now executed on `tcpip_thread` (see
+  "Reliability" above). What remains is the library's *internal* behaviour,
+  which was always correct: its receive path and timers already ran on
+  `tcpip_thread`;
+- `tcpip_thread` has a 2560-byte stack in this Arduino build
+  (`CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`). `esp_wireguard_connect()` now runs
+  there and performs the X25519 key derivation for the new interface. This
+  is the same amount of stack the library's own handshake-response handler
+  already used on that thread before this change, so it introduces no new
+  worst case, but the headroom is not generous. `-DBASTION_STACK_DIAG` logs
+  the high-water mark after each session for verification on new SDKs;
 - a narrow race in the ARP lookup (`main_pc.cpp`): after draining a stale
   semaphore token, there remains a theoretical chance that a callback from
   an already-timed-out previous call is still sitting in the
@@ -549,19 +679,20 @@ Implemented:
 
 Planned:
 
-- a hardware watchdog and a logged reason for every reboot;
-- a ring-buffer log with no secrets in it;
-- A/B OTA, new-version verification, and automatic rollback;
+- A/B OTA (the 16 MB partition table already provides `app0`/`app1`),
+  new-version verification, and automatic rollback;
+- a persisted copy of the last N journal lines across a watchdog reboot;
 - keeping the last known-good configuration until a new one is verified;
-- brownout detection and a stable, independent power supply;
+- a stable, independent power supply (brownout resets are already detected
+  by the chip and show up as `reset: brownout` in the dashboard and journal);
 - for production: Secure Boot V2, Flash Encryption, and signed updates.
 
 ## Implementation stages
 
 1. ~~SSH server on the local network, public-key authentication, and a
    dashboard~~ — done.
-2. `192.168.1.200:22` checks and the `pc ssh` command — done; a ring-buffer
-   log — planned.
+2. ~~`192.168.1.200:22` checks, the `pc ssh` command and an in-memory event
+   journal (`logs`)~~ — done.
 3. Exercising the already-configured WoWLAN from `s2idle`; the `pc wake`
    command is implemented, the actual wake-up test hasn't been run yet.
 4. ~~A single WireGuard profile and remote SSH access to the ESP32 only~~ —
@@ -575,7 +706,8 @@ Planned:
    a web portal on the running device~~ — done (see "Provisioning through
    the setup portal" above). Transactional rollback (restoring the previous
    working set of profiles if the new one fails verification) — planned.
-8. A/B OTA, watchdog fault injection, and extended soak testing.
+8. A/B OTA and extended soak testing. The task watchdog, the Wi-Fi-loss
+   restart and the journal (1.0.0) are the groundwork for it.
 9. Production hardening: Secure Boot, Flash Encryption, unique keys, a
    password on `ESP32_SetUp` or some other protection for provisioning
    against eavesdropping (see "Wizard security" above).
@@ -599,8 +731,9 @@ Lessons from debugging on 2026-08-25/26 — check in this order:
    `ssh -J … user@192.168.1.200 'seq 1 200000' | md5sum`; (b) the session
    itself would crash with `ssh_socket_write: Out of memory` because of a
    non-blocking channel write — fixed on 2026-08-27 (see "Reliability"
-   above). If it recurs, the serial log will show the exact libssh error
-   text and the bytes transferred in each direction.
+   above). If it recurs, `logs` (and the serial log) will show the relay's
+   close reason, the exact libssh error text and the bytes transferred in
+   each direction.
 4. **No handshake at all on the server.** Check that the board's public key
    matches its peer entry on the server (`echo <privkey> | wg pubkey`) and
    the PSK.
@@ -615,7 +748,16 @@ Lessons from debugging on 2026-08-25/26 — check in this order:
    meaning it takes effect within roughly 30 s rather than instantly. If the
    serial log shows a recurring `connect timed out`, check the DNS for the
    profile's `Endpoint` hostname.
-6. **SSH is unreachable after portal setup, even though the portal reported
+6. **The board is unreachable right after flashing, or while a serial
+   monitor is attached.** Every open/close of the USB-serial port resets the
+   board through the auto-reset circuit (DTR/RTS), dropping Wi-Fi, the
+   tunnel and any SSH session for ~3 s; a monitor left open with default
+   DTR/RTS levels can also hold GPIO0 (`BOOT`) low. Since 1.0.0 a low level
+   present at startup is ignored, so the board no longer wanders into the
+   setup portal because of it, but the resets themselves remain: close the
+   serial port before testing anything over the network (see
+   [agent-flashing.md](agent-flashing.md)).
+7. **SSH is unreachable after portal setup, even though the portal reported
    success.** Before the fix, a structurally similar but
    corrupted/truncated SSH key could pass the portal's validation and
    permanently break the SSH server after reboot, with no self-recovery.
@@ -637,4 +779,9 @@ Lessons from debugging on 2026-08-25/26 — check in this order:
   shutdown;
 - an end-to-end test of the ESP32 actually waking the PC via Magic Packet
   (ARP-based MAC learning has already been verified on a live device — see
-  "Wake-on-Wireless LAN" above).
+  "Wake-on-Wireless LAN" above);
+- whether to move to a custom-built Arduino core (ESP-IDF lib builder or
+  pioarduino) solely to raise lwIP's 5760-byte TCP window, which is the only
+  remaining throughput ceiling for remote sessions (see "SSH throughput");
+- whether `tcpip_thread` should get more stack in that same custom build,
+  now that WireGuard setup runs on it.

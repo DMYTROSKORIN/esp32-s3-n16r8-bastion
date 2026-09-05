@@ -5,7 +5,9 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <img alt="Platform" src="https://img.shields.io/badge/platform-ESP32--S3%20(N16R8)-e07020.svg">
+  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.0.0-2ea44f.svg"></a>
+  <a href=".github/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/DMYTROSKORIN/esp32-s3-n16r8-bastion/build.yml?branch=main&label=build"></a>
+  <img alt="Platform" src="https://img.shields.io/badge/board-ESP32--S3--N16R8%20only-e07020.svg">
   <img alt="Framework" src="https://img.shields.io/badge/framework-Arduino%20%2F%20PlatformIO-00979d.svg">
   <img alt="WireGuard" src="https://img.shields.io/badge/VPN-WireGuard%20dual--profile-88171a.svg">
 </p>
@@ -35,23 +37,47 @@ Nothing about the board depends on the PC's own tunnel being healthy — that's 
 Everything is provisioned once, at runtime, through an on-device captive portal. No Wi-Fi password,
 key, or `.conf` file is ever baked into the firmware or committed to a repository.
 
+## Hardware: ESP32-S3-N16R8
+
+This firmware targets exactly one module, the **ESP32-S3-N16R8** — an ESP32-S3 with **16 MB
+quad-SPI flash** and **8 MB octal PSRAM**, on a DevKitC-1 class board (WS2812 RGB LED on GPIO 48,
+`BOOT` button on GPIO 0). The build is tuned to that part rather than to the generic board profile:
+
+| | N16R8 setting | Why it matters |
+|---|---|---|
+| Flash | 16 MB, QIO @ 80 MHz, `default_16MB.csv` | two 6.25 MB OTA slots + 3.4 MB SPIFFS; the board default (`default_8MB.csv`) would leave half the chip unused |
+| PSRAM | 8 MB OPI (`memory_type = qio_opi`), allocations ≥ 512 B go there | libssh's per-packet buffers stop fragmenting the ~320 KB internal heap under btop-class traffic; the event journal lives there too |
+| CPU | 240 MHz, both cores in use | Wi-Fi/lwIP/SSH on core 0; LED, network monitor and WireGuard on core 1 |
+| Crypto | hardware AES, SHA, big-number unit | only AES ciphers are offered over SSH, all hardware-accelerated; chacha20 is not part of this libssh/mbedTLS build |
+| Build | `-O2`, platform pinned to `espressif32 @ 7.0.1` | libssh and WireGuard are compiled from source; flash size is not a constraint |
+
+The boot log prints what it found (`flash 16 MB QIO @ 80 MHz | PSRAM 8189 KB`) and warns if the
+chip is not an N16R8. Other ESP32-S3 variants (N8R2, N16R2, N8…) are **not supported** by this
+configuration — see [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md#target-hardware-esp32-s3-n16r8)
+before attempting a port.
+
 ## Quick look
 
 The SSH console opens straight into a live status dashboard — no separate monitoring needed:
 
 ```text
-  ESP32 Recovery Gateway
+  ESP32 Recovery Gateway  ESP32-S3-N16R8 v1.0.0 · power-on
   ────────────────────────────────────────────────
   Device     ● ONLINE    uptime 0d 00:07:44
-  Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm
+  Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm  up 0d 00:07:39
   Internet   ● ONLINE
   WireGuard  ● ONLINE    profile-1  10.66.0.2  handshake 10s ago
   Main PC    ● ONLINE    192.168.1.200  ssh :22 open
   WoWLAN     ● STANDBY   AA:BB:CC:DD:EE:FF
-  Memory       heap 199 KB  psram 8166 KB  reset: power-on
+  Memory       heap 196 KB (min 171 KB)  psram 8034/8189 KB  sessions 3
   ────────────────────────────────────────────────
   help commands   pc ssh how to reach the PC   pc wake wake it up
 ```
+
+Beyond the dashboard the console offers `watch` (auto-refresh), `logs` (a secrets-free event
+journal: Wi-Fi disconnect reasons, VPN transitions, every SSH login and relay close), `pc ping`,
+`pc wake`, `vpn failover` / `vpn retry-primary`, and `reboot` — all with `help <command>`
+generated from the same table that dispatches them. Arrow keys recall history.
 
 A single onboard RGB LED mirrors the same state without a computer in reach at all — see
 [LED status at a glance](#led-status-at-a-glance) below.
@@ -76,8 +102,8 @@ Applying the form saves everything to NVS and reboots into normal operation. See
 device back to factory state).
 
 Connect from the LAN using the provisioned username and the ESP32's own address, assigned by your
-router's DHCP (shown in the serial log at boot, or your router's lease list) — not the main PC's
-address:
+router's DHCP (shown in the boot log, or in your router's lease list under the hostname
+`esp32-bastion`) — not the main PC's address:
 
 ```sh
 ssh user@192.168.1.120
@@ -98,6 +124,28 @@ factory reset. The single-session SSH server is hardened against stalled or vani
 (key-exchange/auth timeouts, TCP keepalive, idle timeouts), and the bastion relay handles partial
 writes and correctly propagates client-side EOF while draining the PC's remaining response, so full
 interactive sessions — including TUI apps like `btop` — work through the jump chain.
+
+### Throughput and stability of the SSH path
+
+The relay is built for sustained TUI traffic, not just keystrokes:
+
+- **AES only, in hardware.** The server pins `aes128/256-gcm@openssh.com` and `aes128/256-ctr`
+  with SHA-2 MACs and curve25519/ECDH key exchange. All of them run on the S3's hardware AES block;
+  chacha20-poly1305 is not compiled into this libssh/mbedTLS build at all, so OpenSSH clients land on
+  AES-GCM without any configuration.
+- **`select()`-driven relay** on the SSH socket and a raw lwIP socket to the PC: no millisecond
+  polling, 8 KB internal-RAM buffers per direction, `TCP_NODELAY` and keepalive on both sockets.
+- **Back-pressure instead of buffering.** Channel writes are blocking so the client's SSH window
+  throttles the PC through the relay; a write that makes no progress for 30 s ends the relay with a
+  journaled reason instead of exhausting memory (the original `btop` failure mode).
+- **Radio always on.** Wi-Fi modem power-save is disabled: measured idle RTT to the board drops from
+  ~70 ms (9-140 ms jitter) to ~6 ms, which is the difference between a laggy and a crisp console
+  (`-DBASTION_WIFI_POWER_SAVE=1` restores modem-sleep).
+
+One ceiling remains and is documented rather than hidden: the prebuilt Arduino core fixes lwIP's
+TCP window at 5760 bytes, so a single connection is bounded by roughly `5760 B / RTT` — plenty on
+the LAN and for interactive use over WireGuard, but not a file-transfer path. Details and numbers in
+[docs/recovery-access-architecture.md](docs/recovery-access-architecture.md#ssh-throughput-on-the-esp32-s3).
 
 ## Provisioning (Wi-Fi, PC, SSH key, WireGuard)
 
@@ -131,7 +179,12 @@ network is reported inline instead of being discovered only after a reboot.
 The firmware syncs the clock over NTP, starts the primary profile, verifies a recent handshake and
 TCP reachability through the tunnel every 10 seconds, and changes profile only after three
 consecutive failed checks. The SSH console provides `vpn status`, `vpn failover`, and
-`vpn retry-primary`.
+`vpn retry-primary`. Every call into the WireGuard library is executed on lwIP's own thread, which
+is what lwIP's threading model requires and what keeps the failover path free of data races.
+
+The board also supervises itself: a 60 s task watchdog turns any hang into a clean reboot (reported
+as `task-watchdog` on the next dashboard), and ten minutes without Wi-Fi association triggers a
+restart to recover a wedged radio. See [docs/device-behavior.md](docs/device-behavior.md#self-supervision-watchdog-and-automatic-restart).
 
 The full recovery architecture, the failover algorithm, Wake-on-Wireless, SSH-server hardening, the
 reliability fixes applied so far, and a troubleshooting checklist are described in
@@ -171,8 +224,10 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 
 | | |
 |---|---|
-| Board | ESP32-S3-DevKitC-1 class, 16 MB flash, 8 MB Octal PSRAM |
-| Framework | Arduino core for ESP32, built with PlatformIO |
+| Board | **ESP32-S3-N16R8** (16 MB QIO flash, 8 MB OPI PSRAM), DevKitC-1 class — the only supported variant |
+| Firmware | v1.0.0 — see [CHANGELOG.md](CHANGELOG.md) |
+| Framework | Arduino core for ESP32 2.0.17 (ESP-IDF 4.4.7), PlatformIO `espressif32 @ 7.0.1`, `-O2` |
+| CI | [GitHub Actions](.github/workflows/build.yml) builds every push and uploads the binaries |
 | SSH server | [LibSSH-ESP32](https://github.com/ewpa/LibSSH-ESP32) (Arduino port of libssh) |
 | WireGuard client | [esphome-libs/wireguard](https://github.com/esphome-libs/wireguard) (`esp_wireguard`/`wireguardif`) |
 | Docs | [Recovery architecture](docs/recovery-access-architecture.md) · [Device behavior & LED](docs/device-behavior.md) · [CLI reference](docs/cli-reference.md) · [Flashing for AI agents](docs/agent-flashing.md) |
@@ -182,9 +237,9 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 This is a personal-infrastructure project first, but issues and pull requests are welcome, in
 particular around:
 
-- Additional SSH console commands (`watch`, `pc ping`, `logs` — see the roadmap in
-  [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md))
-- A/B OTA updates with automatic rollback
+- A/B OTA updates with automatic rollback (the 16 MB partition table already has both slots)
+- A custom Arduino core build with a larger lwIP TCP window (the one remaining throughput ceiling
+  for remote sessions — see the architecture document)
 - Hardening for production deployment (Secure Boot V2, Flash Encryption, per-device signing)
 
 Please keep the runtime-provisioning model intact — no secrets should ever need to be baked into
