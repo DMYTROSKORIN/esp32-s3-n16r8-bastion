@@ -51,7 +51,7 @@ quad-SPI flash** and **8 MB octal PSRAM**, on a DevKitC-1 class board (WS2812 RG
 | Crypto | hardware AES, SHA, big-number unit | only AES ciphers are offered over SSH, all hardware-accelerated; chacha20 is not part of this libssh/mbedTLS build |
 | Core | pioarduino 55.03.311 (Arduino 3.3.11 / ESP-IDF 5.5.5), IDF libraries rebuilt from source with `custom_sdkconfig` | lwIP TCP window 32 KB instead of the prebuilt core's 5760 B, SACK, 6 KB `tcpip_thread` stack, Wi-Fi/lwIP hot paths in IRAM, everything at `-O2` |
 
-The boot log prints what it found (`flash 16 MB QIO @ 80 MHz | PSRAM 8189 KB`) and warns if the
+The boot log prints what it found (`flash 16 MB QIO @ 80 MHz | PSRAM 8192 KB | SDK 5.5.5`) and warns if the
 chip is not an N16R8. Other ESP32-S3 variants (N8R2, N16R2, N8…) are **not supported** by this
 configuration — see [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md#target-hardware-esp32-s3-n16r8)
 before attempting a port.
@@ -150,11 +150,10 @@ The relay is built for sustained TUI traffic, not just keystrokes:
 - **Radio always on.** Wi-Fi modem power-save is disabled: measured idle RTT to the board drops from
   ~70 ms (9-140 ms jitter) to ~6 ms, which is the difference between a laggy and a crisp console
   (`-DBASTION_WIFI_POWER_SAVE=1` restores modem-sleep).
-
 - **32 KB TCP window.** The prebuilt Arduino core fixes lwIP's window at 5760 bytes, which capped a
   connection at `5760 B / RTT` (~160 KB/s on the LAN, under 200 KB/s over WireGuard). Since 1.1.0 the
   IDF libraries are rebuilt with a 32 KB window, SACK and matching Wi-Fi buffers: on the same bench
-  the relay went from 129-165 to 234-246 KB/s downstream and from 83-89 to 187-270 KB/s upstream.
+  the relay went from 129-165 to 205-250 KB/s downstream and from 83-89 to 126-270 KB/s upstream.
 
 Details, the measurement method and the remaining limits are in
 [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md#ssh-throughput-on-the-esp32-s3).
@@ -262,7 +261,7 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 | Board | **ESP32-S3-N16R8** (16 MB QIO flash, 8 MB OPI PSRAM), DevKitC-1 class — the only supported variant |
 | Firmware | v1.2.0 — see [CHANGELOG.md](CHANGELOG.md); signed OTA images on every [release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) |
 | Framework | Arduino core 3.3.11 / ESP-IDF 5.5.5 via [pioarduino](https://github.com/pioarduino/platform-espressif32) 55.03.311, IDF rebuilt with `custom_sdkconfig`, `-O2`; legacy env on `espressif32 @ 7.0.1` (Arduino 2.0.17) |
-| CI | [GitHub Actions](.github/workflows/build.yml) builds every push and uploads the binaries |
+| CI | [GitHub Actions](.github/workflows/build.yml) builds both environments on every push, signs the OTA image and publishes the release assets on `v*` tags |
 | SSH server | [LibSSH-ESP32](https://github.com/ewpa/LibSSH-ESP32) (Arduino port of libssh) |
 | WireGuard client | [esphome-libs/wireguard](https://github.com/esphome-libs/wireguard) (`esp_wireguard`/`wireguardif`) |
 | Docs | [Recovery architecture](docs/recovery-access-architecture.md) · [Device behavior & LED](docs/device-behavior.md) · [CLI reference](docs/cli-reference.md) · [Flashing for AI agents](docs/agent-flashing.md) |

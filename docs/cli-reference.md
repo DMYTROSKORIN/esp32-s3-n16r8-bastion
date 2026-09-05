@@ -22,9 +22,9 @@ The dashboard uses ANSI colors: a ● indicator on every line — green means
 that specific line is healthy/`ONLINE`, red means Wi-Fi/internet/the main
 PC is unreachable or the VPN has consecutive health-check failures, and
 yellow covers every other WireGuard state (`WAITING`/`CONNECTING`/
-`DEGRADED`/`NOT_CONFIGURED`) as well as `WoWLAN: NO MAC` — plus gray
-secondary details and cyan command hints. The `recovery>` prompt is bold
-green.
+`DEGRADED`/`NOT_CONFIGURED`) as well as `WoWLAN: NO MAC` — plus bright
+white for the facts you act on and cyan for labels and command hints. The
+`recovery>` prompt is bold green.
 
 ```text
   ESP32 Recovery Gateway   v1.2.0   ESP32-S3-N16R8  • reset: power-on

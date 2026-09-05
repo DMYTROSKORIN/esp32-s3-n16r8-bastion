@@ -38,6 +38,12 @@ All notable changes to this project are documented here. The format follows
   red when it was a panic/watchdog/brownout, and a `Firmware` row shows the
   running slot and self-test state.
 
+### Changed
+
+- CI pins PlatformIO 6.1.19: pioarduino's HybridCompile step fails under
+  6.2.0 (`No module named 'SCons.Tool.FortranCommon'`), and 6.1.19 is what the
+  firmware is built and tested with locally.
+
 ### Fixed
 
 - The Arduino core confirmed a freshly booted OTA image unconditionally at
@@ -71,9 +77,9 @@ All notable changes to this project are documented here. The format follows
 - **lwIP TCP window 5760 → 32768 bytes** (`CONFIG_LWIP_TCP_WND_DEFAULT`,
   `CONFIG_LWIP_TCP_SND_BUF_DEFAULT`), receive mailbox 6 → 32 segments, SACK
   on, `tcpip_thread` stack 2560 → 6144 bytes, Wi-Fi driver buffers sized to
-  match (16 static / 64 dynamic RX, 64 dynamic TX, BA window 32), Wi-Fi and
-  lwIP hot paths in IRAM, IDF libraries at `-O2`. This removes the throughput
-  ceiling documented in 1.0.0.
+  match (16 static / 64 dynamic RX, 16 static TX, BA window 32; the dynamic
+  Wi-Fi/lwIP pools in PSRAM), Wi-Fi and lwIP hot paths in IRAM, IDF libraries
+  at `-O2`. This removes the throughput ceiling documented in 1.0.0.
 - Watchdog set-up uses the ESP-IDF 5 API (`esp_task_wdt_reconfigure`) when
   built on IDF 5; the IDF 4 path is kept for the legacy environment.
 - `esp32-s3-n16r8-legacy` environment keeps the 1.0.0 build (official

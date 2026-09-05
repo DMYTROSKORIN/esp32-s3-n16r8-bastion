@@ -34,11 +34,11 @@ memory or flash layout assumes exactly that part:
 | 16 MB flash, QIO @ 80 MHz | `default_16MB.csv`: two 6.25 MB OTA app slots (`app0`/`app1`), 3.4 MB SPIFFS (SSH host key), 64 KB coredump, NVS at 0x9000 (provisioned settings, learned MAC, boot counter). The stock `default_8MB.csv` of the DevKitC-1 board definition would waste half the chip. |
 | 8 MB PSRAM, OPI @ 80 MHz | `board_build.arduino.memory_type = qio_opi`; `heap_caps_malloc_extmem_enable(512)` sends every allocation of 512 B or more to PSRAM, which is what keeps libssh's per-packet buffers from fragmenting the ~320 KB of internal RAM under sustained traffic. The event journal (28 KB) lives there too. Internal RAM is reserved for what must be fast: task stacks, lwIP/Wi-Fi buffers, the two 8 KB relay buffers. |
 | CPU 240 MHz, dual core | Core 0: Wi-Fi driver, lwIP `tcpip_thread`, SSH server task. Core 1: Arduino loop (LED, button, watchdog feed), `net-monitor`, `recovery-vpn`. |
-| Custom-built core | Arduino 3.3.11 / ESP-IDF 5.5.5 (pioarduino 55.03.311) with the IDF libraries rebuilt from source: lwIP TCP window and send buffer 32 KB, receive mailbox 32, SACK, `tcpip_thread` stack 6 KB, 16/64 static/dynamic Wi-Fi RX buffers, 64 TX, BA window 32, Wi-Fi/lwIP hot paths in IRAM, `-O2`. See `custom_sdkconfig` in `platformio.ini`; the legacy environment documents what the stock core gives instead. |
+| Custom-built core | Arduino 3.3.11 / ESP-IDF 5.5.5 (pioarduino 55.03.311) with the IDF libraries rebuilt from source: lwIP TCP window and send buffer 32 KB, receive mailbox 32, SACK, `tcpip_thread` stack 6 KB, 16/64 static/dynamic Wi-Fi RX buffers, 16 static TX, BA window 32, dynamic Wi-Fi/lwIP pools in PSRAM, Wi-Fi/lwIP hot paths in IRAM, `-O2`. See `custom_sdkconfig` in `platformio.ini`; the legacy environment documents what the stock core gives instead. |
 | Hardware AES / SHA / MPI | mbedTLS uses the S3's accelerators for AES (all SSH ciphers offered), SHA-256/512 (MACs, KEX hashes) and big-number math (ECDH). chacha20-poly1305 is not part of this libssh/mbedTLS build (the Arduino core omits mbedTLS's CHACHAPOLY module) and is not offered - see "SSH throughput" below. |
 
 The boot banner prints what it actually found (`flash 16 MB QIO @ 80 MHz |
-PSRAM 8189 KB`) and logs a `WARNING` if the PSRAM or flash size does not
+PSRAM 8192 KB | SDK 5.5.5`) and logs a `WARNING` if the PSRAM or flash size does not
 match the N16R8, because the most likely symptom of a mismatch (libssh
 allocations failing) would otherwise look like a random network bug.
 
@@ -168,30 +168,33 @@ WireGuard tunnel at the board's tunnel IP. Only public-key authentication for
 the user configured through the portal is allowed (currently `user`);
 password authentication is disabled.
 
-Right after login the user sees a summary screen (implemented with ANSI
-colors: a green/yellow/red ● indicator per line, gray secondary details,
-cyan command hints):
+Right after login the user sees a summary screen (ANSI colours: cyan
+labels, a green/yellow/red ● and state word per line, the facts you act on
+in bright white, rules as wide as the client's terminal):
 
 ```text
-  ESP32 Recovery Gateway  ESP32-S3-N16R8 v1.0.0 · power-on
-  ────────────────────────────────────────────────
-  Device     ● ONLINE    uptime 0d 00:07:44
-  Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm  up 0d 00:07:39
+  ESP32 Recovery Gateway   v1.2.0   ESP32-S3-N16R8  • reset: power-on
+  ──────────────────────────────────────────────────────────────────────────────
+  Device     ● ONLINE     up 0d 00:07:44
+  Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
   Internet   ● ONLINE
-  WireGuard  ● ONLINE    profile-1  10.66.0.2  handshake 10s ago
-  Main PC    ● ONLINE    192.168.1.200  ssh :22 open
-  WoWLAN     ● STANDBY   AA:BB:CC:DD:EE:FF
-  Memory       heap 196 KB (min 171 KB)  psram 8034/8189 KB  sessions 3
-  ────────────────────────────────────────────────
-  help commands   pc ssh how to reach the PC   pc wake wake it up
+  WireGuard  ● ONLINE     profile-1  10.66.0.2  handshake 10 s ago
+  Main PC    ● ONLINE     192.168.1.200:22  ssh open
+  WoWLAN     ● STANDBY    aa:bb:cc:dd:ee:ff
+  Memory     ● OK         heap 121 KB (min 114)  psram 8117/8192 KB
+  Firmware   ● CONFIRMED  slot app0  sessions 3
+  ──────────────────────────────────────────────────────────────────────────────
+  help commands   pc ssh reach the PC   pc wake wake it up   ota update
 ```
 
-The header carries the board, firmware version and the reason for the last
-reset. The `VPN errors` line only appears after consecutive health-check
-failures. `WoWLAN` shows `READY` when the main PC is offline and can be
-woken, and `STANDBY` once the PC is already online. `Memory` shows the free
-internal heap with its low-water mark since boot, free/total PSRAM and the
-number of SSH sessions authenticated since boot.
+The header carries the firmware version (highlighted), the board and the
+reason for the last reset (red when it was a panic, watchdog or brownout).
+The `VPN errors` line only appears after consecutive health-check failures.
+`WoWLAN` shows `READY` when the main PC is offline and can be woken, and
+`STANDBY` once the PC is already online. `Memory` grades the free internal
+heap by its low-water mark since boot. `Firmware` shows the running OTA slot
+and whether a freshly installed image is still in its self-test. The exact
+line semantics are in [cli-reference.md](cli-reference.md).
 
 ### SSH server robustness
 
@@ -222,9 +225,11 @@ and take the next session.
 Where the bytes of a `btop` session actually go, and what bounds them:
 
 ```text
-PC ──TCP──▶ ESP32 lwIP rx (5760 B window) ──▶ relay buffer (8 KB) ──▶ libssh encrypt (AES, hw)
-        ──▶ lwIP tx (5760 B send buffer) ──▶ Wi-Fi ──▶ [WireGuard: chacha20 in software] ──▶ client
+PC ──TCP──▶ ESP32 lwIP rx (32 KB window) ──▶ relay buffer (8 KB) ──▶ libssh encrypt (AES, hw)
+        ──▶ lwIP tx (32 KB send buffer) ──▶ Wi-Fi ──▶ [WireGuard: chacha20 in software] ──▶ client
 ```
+
+(5760 B for both buffers on the legacy prebuilt-core environment.)
 
 What the firmware does to keep that path fast and, above all, stable:
 
@@ -661,9 +666,11 @@ Implemented:
   `tcpip_callback()` + a semaphore, see `onLwipThread()` in
   `recovery_vpn.cpp`). The library calls `netif_add/remove/set_default`, the
   raw UDP API, `dns_gethostbyname()` and `sys_timeout()` directly; lwIP
-  requires all of those to run on its own thread (core locking is disabled
-  in this Arduino build), and the previous code called them from the VPN
-  task on core 1 while `tcpip_thread` on core 0 was servicing Wi-Fi traffic.
+  requires all of those to run on its own thread (or under its core lock,
+  which the legacy Arduino 2.x build does not enable; the IDF 5 build has
+  `CONFIG_LWIP_TCPIP_CORE_LOCKING=y`, and the marshalling is correct under
+  both), and the previous code called them from the VPN task on core 1 while
+  `tcpip_thread` on core 0 was servicing Wi-Fi traffic.
   All of the wrapped calls are non-blocking (`connect()` reports an
   in-flight DNS lookup as `ESP_ERR_RETRY`), so the hop costs one context
   switch and never stalls packet processing;
@@ -774,7 +781,8 @@ Planned:
 - keeping the last known-good configuration until a new one is verified;
 - a stable, independent power supply (brownout resets are already detected
   by the chip and show up as `reset: brownout` in the dashboard and journal);
-- for production: Secure Boot V2, Flash Encryption, and signed updates.
+- for production: Secure Boot V2 and Flash Encryption (signed OTA updates
+  exist since 1.2.0).
 
 ## Implementation stages
 

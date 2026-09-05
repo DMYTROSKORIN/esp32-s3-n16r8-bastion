@@ -245,9 +245,9 @@ both checks run through WireGuard.
   shows the reset reason and `logs` the last events before it. `brownout`
   means the USB supply dipped; `task-watchdog` means a task hung and the
   watchdog recovered the board.
-- **Console feels laggy / btop stutters over VPN:** expected to a degree —
-  the TCP window of the ESP32's network stack caps a single connection at
-  roughly 5760 bytes per round-trip (see "SSH throughput" in the
+- **Console feels laggy / btop stutters over VPN:** a single connection is
+  bounded by the TCP window per round-trip: 32 KB on the default firmware,
+  5760 bytes on the legacy prebuilt-core build (see "SSH throughput" in the
   architecture document). Over the LAN the session should be snappy; if it
   is not, check RSSI with `net status`.
 - **WoWLAN doesn't wake the PC:** the console shows `NO MAC` on the `WoWLAN`
