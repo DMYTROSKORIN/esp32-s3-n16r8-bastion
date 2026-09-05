@@ -4,8 +4,17 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <atomic>
-#include <esp_app_desc.h>
+#include <esp_idf_version.h>
+#include <sdkconfig.h>
+// HTTPS download needs the CA bundle API of ESP-IDF 5 (default build); the
+// legacy IDF 4.4 environment keeps only the SSH upload path.
+#define BASTION_OTA_HTTPS (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
+#if BASTION_OTA_HTTPS
 #include <esp_crt_bundle.h>
+#endif
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+#include <esp_app_desc.h>  // esp_app_desc_t; on IDF 4.4 it comes with esp_ota_ops.h
+#endif
 #include <esp_http_client.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
@@ -319,6 +328,12 @@ bool otaFromUrl(const char* url, OtaReportFn reportFn, void* userData, OtaResult
     return false;
   }
 
+#if !BASTION_OTA_HTTPS
+  setResult(result, false,
+            "HTTPS download is not available on the legacy build; use "
+            "`ssh <user>@<board> ota < firmware-signed.bin`");
+  return false;
+#else
   esp_http_client_config_t config = {};
   config.url = url;
   config.crt_bundle_attach = esp_crt_bundle_attach;
@@ -431,6 +446,7 @@ done:
     eventLogf("OTA: download from URL failed: %s", result.message);
   }
   return ok;
+#endif
 }
 
 // ---------------------------------------------------------------------------

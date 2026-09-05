@@ -9,3 +9,5 @@
 managed_components/
 sdkconfig.esp32-s3-n16r8*
 sdkconfig.defaults
+src/idf_component.yml
+src/idf_component.yml.orig
