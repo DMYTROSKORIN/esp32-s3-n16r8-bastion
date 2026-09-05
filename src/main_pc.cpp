@@ -8,18 +8,20 @@
 #include <lwip/ip4_addr.h>
 #include <lwip/netif.h>
 #include <lwip/tcpip.h>
+#include <ping/ping_sock.h>
 #include <string.h>
 
 #include "device_config.h"
+#include "event_log.h"
 
 namespace {
 constexpr uint32_t kMaintainIntervalMs = 60000;
 constexpr uint32_t kMaintainProbeTimeoutMs = 400;
 constexpr uint16_t kWolPort = 9;
 
-// pcMac/pcMacValid/pcMacLoaded are written from the main loop (learning a
-// freshly-seen MAC, core 1) and read from the SSH task (dashboard/pc
-// wake/pc status, core 0). A spinlock plus copying a snapshot before use
+// pcMac/pcMacValid/pcMacLoaded are written from the net-monitor task
+// (learning a freshly-seen MAC, core 1) and read from the SSH task
+// (dashboard/pc wake/pc status, core 0). A spinlock plus copying a snapshot before use
 // keeps every read and write of these three fields consistent with each
 // other, instead of a formatter or a wake packet potentially mixing bytes
 // from an old and a newly-learned MAC.
@@ -154,9 +156,8 @@ void mainPcMaintain() {
 
   if (changed) {
     deviceConfigMacStore(learned);
-    Serial.printf("Main PC: learned MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
-                  learned[0], learned[1], learned[2], learned[3], learned[4],
-                  learned[5]);
+    eventLogf("Main PC: learned MAC %02x:%02x:%02x:%02x:%02x:%02x", learned[0],
+              learned[1], learned[2], learned[3], learned[4], learned[5]);
   }
 }
 
@@ -215,4 +216,84 @@ bool mainPcWake() {
   }
   udp.stop();
   return sent;
+}
+
+namespace {
+struct PingContext {
+  PingStats stats;
+  uint32_t sumMs;
+  SemaphoreHandle_t done;
+};
+
+void onPingSuccess(esp_ping_handle_t handle, void* argument) {
+  PingContext* context = static_cast<PingContext*>(argument);
+  uint32_t elapsedMs = 0;
+  esp_ping_get_profile(handle, ESP_PING_PROF_TIMEGAP, &elapsedMs, sizeof(elapsedMs));
+  ++context->stats.received;
+  context->sumMs += elapsedMs;
+  if (context->stats.received == 1 || elapsedMs < context->stats.minMs) {
+    context->stats.minMs = elapsedMs;
+  }
+  if (elapsedMs > context->stats.maxMs) {
+    context->stats.maxMs = elapsedMs;
+  }
+}
+
+void onPingTimeout(esp_ping_handle_t, void*) {}
+
+void onPingEnd(esp_ping_handle_t handle, void* argument) {
+  PingContext* context = static_cast<PingContext*>(argument);
+  uint32_t sent = 0;
+  esp_ping_get_profile(handle, ESP_PING_PROF_REQUEST, &sent, sizeof(sent));
+  context->stats.sent = sent;
+  if (context->stats.received > 0) {
+    context->stats.avgMs = context->sumMs / context->stats.received;
+  }
+  xSemaphoreGive(context->done);
+}
+}  // namespace
+
+bool mainPcPing(uint8_t count, PingStats& stats) {
+  stats = PingStats{};
+  if (gDeviceConfig.pcIp[0] == '\0' || WiFi.status() != WL_CONNECTED || count == 0) {
+    return false;
+  }
+  // One ping burst at a time: the SSH console is single-session, so a static
+  // context is enough and avoids a heap allocation per command.
+  static PingContext context;
+  static SemaphoreHandle_t done = xSemaphoreCreateBinary();
+  if (done == nullptr) {
+    return false;
+  }
+  while (xSemaphoreTake(done, 0) == pdTRUE) {
+  }
+  context = PingContext{};
+  context.done = done;
+
+  esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
+  config.count = count;
+  config.interval_ms = 500;
+  config.timeout_ms = 1000;
+  config.target_addr.type = IPADDR_TYPE_V4;
+  config.target_addr.u_addr.ip4.addr = static_cast<uint32_t>(configuredPcIp());
+
+  esp_ping_callbacks_t callbacks = {};
+  callbacks.cb_args = &context;
+  callbacks.on_ping_success = onPingSuccess;
+  callbacks.on_ping_timeout = onPingTimeout;
+  callbacks.on_ping_end = onPingEnd;
+
+  esp_ping_handle_t handle = nullptr;
+  if (esp_ping_new_session(&config, &callbacks, &handle) != ESP_OK) {
+    return false;
+  }
+  esp_ping_start(handle);
+  // Worst case: count x (interval + timeout), plus slack.
+  const TickType_t budget =
+      pdMS_TO_TICKS(static_cast<uint32_t>(count) * 1500UL + 2000UL);
+  const bool finished = xSemaphoreTake(done, budget) == pdTRUE;
+  esp_ping_stop(handle);
+  esp_ping_delete_session(handle);
+  stats = context.stats;
+  return finished;
 }

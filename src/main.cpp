@@ -1,18 +1,23 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClient.h>
 #include <esp_heap_caps.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#include <esp_task_wdt.h>
+#include <esp_wifi.h>
 #include <math.h>
 
 #include "device_config.h"
-#include "main_pc.h"
+#include "event_log.h"
+#include "firmware_info.h"
+#include "net_monitor.h"
 #include "recovery_ssh.h"
-#include "recovery_status.h"
 #include "recovery_vpn.h"
 #include "setup_portal.h"
 
 namespace {
 constexpr uint8_t kBootButtonPin = 0;
+constexpr char kHostname[] = "esp32-bastion";
 
 // Two hold tiers on the same button: 5 s reopens the setup portal pre-filled
 // with the current settings, 10 s wipes everything back to factory state.
@@ -27,37 +32,23 @@ constexpr uint32_t kHoldFeedbackStartMs = 3000;
 // deliberate press or release, so it can't be mistaken for one.
 constexpr uint32_t kBootDebounceMs = 30;
 
-constexpr uint32_t kReconnectIntervalMs = 10000;
-constexpr uint32_t kInternetCheckIntervalMs = 10000;
-constexpr uint32_t kInternetConnectTimeoutMs = 1000;
+// Task watchdog. The Arduino loop task and the net-monitor task feed it; both
+// are designed so that no single iteration ever legitimately exceeds a few
+// seconds (the longest is the portal's 15 s Wi-Fi trial, which feeds inside
+// its wait loop). 60 s therefore only fires for a genuine hang - a wedged
+// lwIP call, a deadlock, an infinite loop - and turns it into a clean reboot
+// with `reset: task-watchdog` in the next dashboard instead of a dead board.
+constexpr uint32_t kWatchdogTimeoutSeconds = 60;
 
-const IPAddress kInternetCheckHosts[] = {
-    IPAddress(8, 8, 8, 8),
-    IPAddress(8, 8, 4, 4),
-};
-constexpr uint16_t kDnsPort = 53;
-
-enum class DeviceState {
-  kSetup,
-  kConnecting,
-  kOnline,
-  kNoInternet,
-};
-
-DeviceState deviceState = DeviceState::kConnecting;
+enum class DeviceMode { kSetup, kRun };
+DeviceMode deviceMode = DeviceMode::kRun;
+NetState lastLedState = NetState::kConnecting;
 uint32_t stateStartedMs = 0;
-uint32_t lastReconnectMs = 0;
-uint32_t lastInternetCheckMs = 0;
 uint32_t bootHoldElapsedMs = 0;
 
-// loop() can block for up to ~2.4 s at a time (the internet check below, the
-// PC reachability probe in mainPcMaintain()) while still needing to time a
-// human's BOOT-button hold accurately enough to tell a 5 s press from a 10 s
-// one. Sampling digitalRead() once per loop() iteration missed or
-// mistimed press/release edges that happened to fall inside one of those
-// blocking windows. An interrupt latches the true edge timestamps the
-// instant they happen, independent of how late loop() gets around to
-// reading them.
+// loop() must time a human's BOOT-button hold accurately enough to tell a
+// 5 s press from a 10 s one; an interrupt latches the true edge timestamps
+// the instant they happen, independent of how late loop() reads them.
 portMUX_TYPE bootButtonMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool bootButtonPressed = false;
 volatile uint32_t bootPressStartMs = 0;
@@ -76,7 +67,12 @@ void IRAM_ATTR bootButtonIsr() {
     if (digitalRead(kBootButtonPin) == LOW) {
       bootButtonPressed = true;
       bootPressStartMs = now;
-    } else {
+    } else if (bootButtonPressed) {
+      // Only a release that follows a press *observed by this firmware*
+      // counts. GPIO0 is also driven by the USB-serial auto-reset circuit
+      // (esptool, serial monitors), which routinely holds it low across a
+      // reset; a bare release edge with no recorded press is that circuit
+      // letting go, not a human finishing a 5 s hold.
       bootButtonPressed = false;
       bootReleaseMs = now;
       bootReleasePending = true;
@@ -100,30 +96,6 @@ void setLed(uint8_t red, uint8_t green, uint8_t blue) {
   neopixelWrite(RGB_BUILTIN, red, green, blue);
 }
 
-const char* stateName(DeviceState state) {
-  switch (state) {
-    case DeviceState::kSetup:
-      return "SETUP";
-    case DeviceState::kConnecting:
-      return "CONNECTING";
-    case DeviceState::kOnline:
-      return "ONLINE";
-    case DeviceState::kNoInternet:
-      return "NO_INTERNET";
-  }
-  return "UNKNOWN";
-}
-
-void setState(DeviceState nextState) {
-  if (deviceState == nextState) {
-    return;
-  }
-
-  deviceState = nextState;
-  stateStartedMs = millis();
-  Serial.printf("State: %s\n", stateName(deviceState));
-}
-
 // Brightness of a short flash at `elapsedMs` into a window of `durationMs`,
 // eased in and out over `edgeMs` at each end instead of snapping on/off.
 uint8_t easedFlashLevel(uint32_t elapsedMs, uint32_t durationMs, uint8_t peak,
@@ -142,9 +114,7 @@ uint8_t easedFlashLevel(uint32_t elapsedMs, uint32_t durationMs, uint8_t peak,
 }
 
 // Brightness for a burst of `count` identical soft-edged flashes starting at
-// `startMs` into the cycle, `flashMs` on and `gapMs` off between them. Used
-// to count out a small number (Wi-Fi+internet OK, or which VPN profile is
-// active) as a number of blinks rather than a single on/off state.
+// `startMs` into the cycle, `flashMs` on and `gapMs` off between them.
 uint8_t burstLevel(uint32_t phase, uint32_t startMs, uint8_t count,
                    uint32_t flashMs, uint32_t gapMs, uint8_t peak,
                    uint32_t edgeMs) {
@@ -171,14 +141,20 @@ void renderStatusLed() {
     return;
   }
 
+  if (deviceMode == DeviceMode::kSetup) {
+    setLed(40, 20, 0);  // Solid yellow.
+    return;
+  }
+
+  const NetState state = netMonitorState();
+  if (state != lastLedState) {
+    lastLedState = state;
+    stateStartedMs = millis();
+  }
   const uint32_t elapsed = millis() - stateStartedMs;
 
-  switch (deviceState) {
-    case DeviceState::kSetup:
-      setLed(40, 20, 0);  // Solid yellow.
-      break;
-
-    case DeviceState::kConnecting: {
+  switch (state) {
+    case NetState::kConnecting: {
       // Smooth blue "breathing" pulse (sine envelope) instead of a hard
       // blink: this is a wait state, not an alert, so it reads calmer.
       constexpr uint32_t kBreathMs = 1800;
@@ -189,10 +165,10 @@ void renderStatusLed() {
       break;
     }
 
-    case DeviceState::kOnline: {
+    case NetState::kOnline: {
       // Heartbeat: two soft-edged green flashes confirm Wi-Fi + internet.
-      // Violet flashes count out which VPN profile is active — one flash
-      // for the primary, two for the secondary/failover profile — so a
+      // Violet flashes count out which VPN profile is active - one flash
+      // for the primary, two for the secondary/failover profile - so a
       // glance at the LED shows both "is the VPN up" and "which server".
       // No violet at all means the VPN is not up (or not configured).
       constexpr uint32_t kCycleMs = 3600;
@@ -216,28 +192,16 @@ void renderStatusLed() {
       break;
     }
 
-    case DeviceState::kNoInternet:
+    case NetState::kNoInternet:
       setLed((elapsed % 200U) < 100U ? 50 : 0, 0, 0);  // Fast red blink.
       break;
   }
 }
 
-bool hasInternetAccess() {
-  for (const IPAddress& host : kInternetCheckHosts) {
-    WiFiClient client;
-    if (client.connect(host, kDnsPort, kInternetConnectTimeoutMs)) {
-      client.stop();
-      return true;
-    }
-    client.stop();
-  }
-  return false;
-}
-
 // Flashes the reset confirmation, wipes all provisioned settings, and
 // restarts into the (now unprovisioned) setup portal. Never returns.
 void doFactoryReset() {
-  Serial.println("BOOT held 10s: factory reset.");
+  eventLogf("BOOT held 10s: factory reset.");
   const uint32_t flashStartMs = millis();
   while (millis() - flashStartMs < kFactoryResetFlashMs) {
     setLed((millis() % 200U) < 100U ? 60 : 0, 0, 0);
@@ -261,7 +225,7 @@ void handleBootButton() {
   portEXIT_CRITICAL(&bootButtonMux);
 
   if (releasePending && releaseMs - pressStartMs >= kEditModeHoldMs) {
-    Serial.println("BOOT held 5s: reopening setup portal.");
+    eventLogf("BOOT held 5s: reopening setup portal.");
     portalRequestFlagSet();
     delay(200);
     ESP.restart();
@@ -278,38 +242,137 @@ void handleBootButton() {
   }
 }
 
-void handleNetworkState() {
-  const uint32_t now = millis();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    setState(DeviceState::kConnecting);
-    if (now - lastReconnectMs >= kReconnectIntervalMs) {
-      Serial.println("Wi-Fi disconnected; retrying saved network.");
-      WiFi.reconnect();
-      lastReconnectMs = now;
-    }
-    return;
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:
+      return "power-on";
+    case ESP_RST_SW:
+      return "software";
+    case ESP_RST_PANIC:
+      return "panic";
+    case ESP_RST_INT_WDT:
+      return "interrupt-watchdog";
+    case ESP_RST_TASK_WDT:
+      return "task-watchdog";
+    case ESP_RST_WDT:
+      return "watchdog";
+    case ESP_RST_BROWNOUT:
+      return "brownout";
+    case ESP_RST_DEEPSLEEP:
+      return "deep-sleep";
+    default:
+      return "other";
   }
+}
 
-  if (lastInternetCheckMs != 0 &&
-      now - lastInternetCheckMs < kInternetCheckIntervalMs) {
-    return;
+const char* wifiDisconnectReasonName(uint8_t reason) {
+  switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+      return "auth expired";
+    case WIFI_REASON_AUTH_LEAVE:
+      return "auth leave";
+    case WIFI_REASON_ASSOC_EXPIRE:
+      return "assoc expired";
+    case WIFI_REASON_ASSOC_LEAVE:
+      return "assoc leave";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+      return "4-way handshake timeout (wrong password?)";
+    case WIFI_REASON_BEACON_TIMEOUT:
+      return "beacon timeout";
+    case WIFI_REASON_NO_AP_FOUND:
+      return "AP not found";
+    case WIFI_REASON_AUTH_FAIL:
+      return "auth failed";
+    case WIFI_REASON_ASSOC_FAIL:
+      return "assoc failed";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+      return "handshake timeout";
+    case WIFI_REASON_CONNECTION_FAIL:
+      return "connection failed";
+    default:
+      return "other";
   }
+}
 
-  lastInternetCheckMs = now;
-  const bool online = hasInternetAccess();
-  setState(online ? DeviceState::kOnline : DeviceState::kNoInternet);
-  Serial.printf("Internet: %s | IP: %s | RSSI: %d dBm\n",
-                online ? "available" : "unavailable",
-                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      eventLogf("Wi-Fi: got IP %s (gw %s, ch %d, %d dBm)",
+                WiFi.localIP().toString().c_str(),
+                WiFi.gatewayIP().toString().c_str(), WiFi.channel(), WiFi.RSSI());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      eventLogf("Wi-Fi: disconnected, reason %u (%s)",
+                info.wifi_sta_disconnected.reason,
+                wifiDisconnectReasonName(info.wifi_sta_disconnected.reason));
+      break;
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+      eventLogf("Wi-Fi: lost IP");
+      break;
+    default:
+      break;
+  }
+}
+
+const char* flashModeName(FlashMode_t mode) {
+  switch (mode) {
+    case FM_QIO:
+      return "QIO";
+    case FM_QOUT:
+      return "QOUT";
+    case FM_DIO:
+      return "DIO";
+    case FM_DOUT:
+      return "DOUT";
+    case FM_FAST_READ:
+      return "FAST_READ";
+    case FM_SLOW_READ:
+      return "SLOW_READ";
+    default:
+      return "unknown";
+  }
+}
+
+void logBootBanner(uint32_t bootCount) {
+  eventLogf("ESP32-S3-N16R8 Bastion v%s starting (boot #%lu, reset: %s)",
+            FIRMWARE_VERSION, static_cast<unsigned long>(bootCount),
+            resetReasonName(esp_reset_reason()));
+  eventLogf("Chip: %s rev %d @ %u MHz | flash %u MB %s @ %u MHz | PSRAM %u KB | SDK %s",
+            ESP.getChipModel(), ESP.getChipRevision(),
+            static_cast<unsigned>(ESP.getCpuFreqMHz()),
+            static_cast<unsigned>(ESP.getFlashChipSize() / (1024U * 1024U)),
+            flashModeName(ESP.getFlashChipMode()),
+            static_cast<unsigned>(ESP.getFlashChipSpeed() / 1000000U),
+            static_cast<unsigned>(ESP.getPsramSize() / 1024U), ESP.getSdkVersion());
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (running != nullptr) {
+    eventLogf("Partition: %s @ 0x%lx, %lu KB (app uses %lu KB)", running->label,
+              static_cast<unsigned long>(running->address),
+              static_cast<unsigned long>(running->size / 1024UL),
+              static_cast<unsigned long>(ESP.getSketchSize() / 1024UL));
+  }
+  // This firmware is tuned for the N16R8 module. Warn loudly - but keep
+  // running - when the hardware underneath is something else, because the
+  // most likely symptom (libssh allocations failing without PSRAM) would
+  // otherwise look like a random network bug.
+  if (ESP.getPsramSize() < 4U * 1024U * 1024U) {
+    eventLogf("WARNING: expected 8 MB PSRAM (N16R8), found %u KB - check "
+              "board_build.arduino.memory_type",
+              static_cast<unsigned>(ESP.getPsramSize() / 1024U));
+  }
+  if (ESP.getFlashChipSize() < 16U * 1024U * 1024U) {
+    eventLogf("WARNING: expected 16 MB flash (N16R8), found %u MB",
+              static_cast<unsigned>(ESP.getFlashChipSize() / (1024U * 1024U)));
+  }
 }
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
   delay(1500);
+  eventLogInit();
 
-  // The Arduino core already routes large mallocs to PSRAM (~7 MB, vs.
+  // The Arduino core already routes large mallocs to PSRAM (~8 MB, vs.
   // ~320 KB of internal RAM); lower the threshold further so libssh's much
   // smaller per-packet buffers land there too. Under sustained high-volume
   // traffic (a full-screen TUI redrawing constantly) those small internal
@@ -320,59 +383,70 @@ void setup() {
   heap_caps_malloc_extmem_enable(512);
 
   pinMode(kBootButtonPin, INPUT_PULLUP);
-  // Initialize from the current level in case BOOT is already held at boot
-  // (no edge would otherwise ever fire for it), then track further edges.
-  bootButtonPressed = digitalRead(kBootButtonPin) == LOW;
-  bootPressStartMs = millis();
+  // A LOW level already present at boot is deliberately *not* treated as a
+  // press: on DevKitC-class boards GPIO0 is shared with the USB-serial
+  // auto-reset circuit, and esptool or an attached serial monitor leaves it
+  // low for seconds after a reset. Counting that as a hold used to reboot a
+  // freshly flashed board into the setup portal (5 s) or, worse, factory
+  // reset it (10 s). Holding BOOT through power-up is documented as
+  // unsupported anyway (the ROM treats it as download mode). The hold timers
+  // therefore start only from a falling edge seen after this point.
+  bootButtonPressed = false;
+  bootPressStartMs = 0;
   attachInterrupt(digitalPinToInterrupt(kBootButtonPin), bootButtonIsr, CHANGE);
 
   Serial.println();
-  Serial.println("ESP32-S3-N16R8 Bastion starting");
-  Serial.printf("Chip: %s rev %d | Flash: %u MB | PSRAM: %u MB\n",
-                ESP.getChipModel(), ESP.getChipRevision(),
-                ESP.getFlashChipSize() / (1024U * 1024U),
-                ESP.getPsramSize() / (1024U * 1024U));
+  const uint32_t bootCount = deviceConfigBumpBootCount();
+  logBootBanner(bootCount);
+
+  // Watchdog on the loop task; the net-monitor task subscribes itself.
+  esp_task_wdt_init(kWatchdogTimeoutSeconds, true);
+  esp_task_wdt_add(nullptr);
 
   deviceConfigLoad();
   const bool editRequested = portalRequestFlagTake();
 
+  WiFi.onEvent(onWifiEvent);
+  WiFi.setHostname(kHostname);
+
   if (!deviceConfigPresent() || editRequested) {
+    deviceMode = DeviceMode::kSetup;
     setupPortalStart();
-    setState(DeviceState::kSetup);
+    eventLogf("State: SETUP");
     return;
   }
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+  // Modem power-save (the Arduino default) lets the radio doze between
+  // beacons, which costs 50-300 ms of latency on the first packet after any
+  // pause and visibly throttles sustained throughput. This board is
+  // USB-powered and exists to be reachable instantly, so the radio stays
+  // awake. Build with -DBASTION_WIFI_POWER_SAVE=1 to keep modem-sleep (e.g.
+  // on a marginal power supply that browns out with the radio always on).
+#if defined(BASTION_WIFI_POWER_SAVE) && BASTION_WIFI_POWER_SAVE
+  WiFi.setSleep(WIFI_PS_MIN_MODEM);
+  eventLogf("Wi-Fi: modem power-save enabled (build option)");
+#else
+  WiFi.setSleep(WIFI_PS_NONE);
+#endif
   WiFi.begin(gDeviceConfig.wifiSsid,
              gDeviceConfig.wifiPassword[0] != '\0' ? gDeviceConfig.wifiPassword
                                                     : nullptr);
-  Serial.printf("Connecting to Wi-Fi: %s\n", gDeviceConfig.wifiSsid);
-  lastReconnectMs = millis();
-  setState(DeviceState::kConnecting);
+  eventLogf("Wi-Fi: connecting to %s", gDeviceConfig.wifiSsid);
+  eventLogf("State: CONNECTING");
 
+  netMonitorStart();
   startRecoverySshServer();
   startRecoveryVpn();
 }
 
 void loop() {
+  esp_task_wdt_reset();
   handleBootButton();
-
-  if (deviceState == DeviceState::kSetup) {
+  if (deviceMode == DeviceMode::kSetup) {
     setupPortalLoop();
-  } else {
-    handleNetworkState();
-    mainPcMaintain();
   }
-
   renderStatusLed();
   delay(5);
-}
-
-const char* recoveryNetworkStateName() {
-  return stateName(deviceState);
-}
-
-bool recoveryInternetAvailable() {
-  return deviceState == DeviceState::kOnline;
 }

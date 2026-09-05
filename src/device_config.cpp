@@ -6,11 +6,14 @@
 #include <WiFi.h>
 #include <string.h>
 
+#include "event_log.h"
+
 namespace {
 constexpr char kNamespace[] = "recovery";
 constexpr char kConfigKey[] = "cfg";
 constexpr char kMacKey[] = "pcmac";
 constexpr char kPortalKey[] = "portal";
+constexpr char kBootCountKey[] = "boots";
 // Bumped because WgProfileConfig grew a field (vpnServerSshPort); the
 // deviceConfigLoad() size check below already forces a reprovision on any
 // layout change, but the version bump keeps that self-documenting.
@@ -25,7 +28,9 @@ bool deviceConfigLoad() {
   if (!prefs.begin(kNamespace, true)) {
     return false;
   }
-  const size_t stored = prefs.getBytesLength(kConfigKey);
+  // isKey() first: getBytesLength() on a missing key logs an error through
+  // the Arduino core, which is noise on every unprovisioned boot.
+  const size_t stored = prefs.isKey(kConfigKey) ? prefs.getBytesLength(kConfigKey) : 0;
   bool loaded = false;
   if (stored == sizeof(DeviceConfig)) {
     loaded = prefs.getBytes(kConfigKey, &gDeviceConfig, sizeof(DeviceConfig)) ==
@@ -72,7 +77,7 @@ void deviceConfigFactoryReset() {
     }
   }
   if (!cleared) {
-    Serial.println("Factory reset: failed to clear stored preferences");
+    eventLogf("Factory reset: failed to clear stored preferences");
   }
 
   // Earlier firmware revisions stored credentials in the WiFi library's own
@@ -87,7 +92,7 @@ void deviceConfigFactoryReset() {
     }
   }
   if (!keyRemoved) {
-    Serial.println("Factory reset: failed to remove SSH host key");
+    eventLogf("Factory reset: failed to remove SSH host key");
   }
   // The persistent state above is what matters and is now cleared; the
   // caller restarts within ~2 s of this call, so gDeviceConfig itself is
@@ -104,7 +109,7 @@ bool deviceConfigMacLoad(uint8_t mac[6]) {
   if (!prefs.begin(kNamespace, true)) {
     return false;
   }
-  const bool present = prefs.getBytes(kMacKey, mac, 6) == 6;
+  const bool present = prefs.isKey(kMacKey) && prefs.getBytes(kMacKey, mac, 6) == 6;
   prefs.end();
   return present;
 }
@@ -112,11 +117,11 @@ bool deviceConfigMacLoad(uint8_t mac[6]) {
 void deviceConfigMacStore(const uint8_t mac[6]) {
   Preferences prefs;
   if (!prefs.begin(kNamespace, false)) {
-    Serial.println("Main PC: failed to open storage for learned MAC");
+    eventLogf("Main PC: failed to open storage for learned MAC");
     return;
   }
   if (prefs.putBytes(kMacKey, mac, 6) != 6) {
-    Serial.println("Main PC: failed to persist learned MAC");
+    eventLogf("Main PC: failed to persist learned MAC");
   }
   prefs.end();
 }
@@ -124,7 +129,7 @@ void deviceConfigMacStore(const uint8_t mac[6]) {
 void portalRequestFlagSet() {
   Preferences prefs;
   if (!prefs.begin(kNamespace, false)) {
-    Serial.println("Portal: failed to open storage for portal-reopen flag");
+    eventLogf("Portal: failed to open storage for portal-reopen flag");
     return;
   }
   // A failure here means the BOOT-5s "reopen portal" request silently does
@@ -132,7 +137,7 @@ void portalRequestFlagSet() {
   // reboots into its normal connected state, which looks like the button
   // press was ignored rather than like a storage error.
   if (prefs.putUChar(kPortalKey, 1) != 1) {
-    Serial.println("Portal: failed to persist portal-reopen flag");
+    eventLogf("Portal: failed to persist portal-reopen flag");
   }
   prefs.end();
 }
@@ -148,4 +153,15 @@ bool portalRequestFlagTake() {
   }
   prefs.end();
   return requested;
+}
+
+uint32_t deviceConfigBumpBootCount() {
+  Preferences prefs;
+  if (!prefs.begin(kNamespace, false)) {
+    return 0;
+  }
+  const uint32_t count = prefs.getUInt(kBootCountKey, 0) + 1;
+  prefs.putUInt(kBootCountKey, count);
+  prefs.end();
+  return count;
 }

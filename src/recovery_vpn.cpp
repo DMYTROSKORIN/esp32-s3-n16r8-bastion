@@ -4,9 +4,13 @@
 #include <WiFiClient.h>
 #include <atomic>
 #include <esp_wireguard.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <lwip/tcpip.h>
 #include <time.h>
 
 #include "device_config.h"
+#include "event_log.h"
 
 namespace {
 constexpr uint32_t kTaskStack = 16384;
@@ -45,11 +49,8 @@ enum class VpnRequest : uint8_t { kNone, kFailover, kPrimary };
 wireguard_config_t wireGuardConfig = ESP_WIREGUARD_CONFIG_DEFAULT();
 wireguard_ctx_t wireGuardContext = ESP_WIREGUARD_CONTEXT_DEFAULT();
 // The VPN task (core 1) writes these; the SSH task (core 0) and the main
-// loop read them for the dashboard/status commands. `volatile` only stops
-// the compiler from caching a value in a register - it is not a C++
-// synchronization primitive and does not make cross-core reads/writes of a
-// plain variable well-defined. std::atomic is the correct tool here and
-// costs nothing extra on scalars this small.
+// loop read them for the dashboard/status commands. std::atomic makes the
+// cross-core reads/writes well-defined at zero cost on scalars this small.
 std::atomic<VpnState> vpnState{VpnState::kNotConfigured};
 std::atomic<int8_t> activeProfile{-1};
 std::atomic<uint8_t> consecutiveFailures{0};
@@ -57,6 +58,58 @@ std::atomic<uint32_t> handshakeAgeSeconds{UINT32_MAX};
 std::atomic<VpnRequest> pendingRequest{VpnRequest::kNone};
 bool tunnelInitialized = false;
 uint32_t profileStartedMs = 0;
+
+// ---------------------------------------------------------------------------
+// lwIP thread marshalling
+//
+// esp_wireguard/wireguardif manipulate lwIP core state directly: netif_add /
+// netif_remove / netif_set_default, the raw UDP API, dns_gethostbyname() and,
+// most dangerously, sys_timeout(), whose timer list has no locking at all.
+// lwIP requires every one of those to run on the tcpip_thread (this Arduino
+// build has CONFIG_LWIP_TCPIP_CORE_LOCKING disabled), yet the library calls
+// them from whatever task invokes it. Calling them from this task on core 1
+// while tcpip_thread on core 0 services Wi-Fi traffic is a genuine data race
+// on the netif list, the UDP PCB list and the timeout list - rare, but the
+// kind that corrupts a pointer once a month and reboots the bastion in the
+// middle of the night.
+//
+// Every library call below is therefore hopped onto tcpip_thread with
+// tcpip_callback() and waited for. All of them are non-blocking (connect()
+// reports an in-flight DNS lookup as ESP_ERR_RETRY instead of waiting), so
+// the hop costs one context switch and never stalls network processing.
+// ---------------------------------------------------------------------------
+
+struct LwipJob {
+  void (*run)(void* state);
+  void* state;
+  SemaphoreHandle_t done;
+};
+
+void lwipJobTrampoline(void* argument) {
+  LwipJob* job = static_cast<LwipJob*>(argument);
+  job->run(job->state);
+  xSemaphoreGive(job->done);
+}
+
+// Runs `functor()` on tcpip_thread and blocks until it has returned. Only the
+// VPN task calls this, so a single static job/semaphore pair suffices.
+template <typename Functor>
+void onLwipThread(Functor&& functor) {
+  static SemaphoreHandle_t done = xSemaphoreCreateBinary();
+  static LwipJob job;
+  job.run = [](void* state) { (*static_cast<Functor*>(state))(); };
+  job.state = &functor;
+  job.done = done;
+  if (tcpip_callback(lwipJobTrampoline, &job) != ERR_OK) {
+    // Out of tcpip mailbox slots - practically impossible at our call rate,
+    // but never fall through to a direct (racy) call: run it in place only
+    // as the very last resort so the tunnel logic still makes progress.
+    eventLogf("WireGuard: tcpip_callback unavailable, running in place");
+    functor();
+    return;
+  }
+  xSemaphoreTake(done, portMAX_DELAY);
+}
 
 void noteFailure() {
   if (consecutiveFailures < UINT8_MAX) {
@@ -86,7 +139,7 @@ const WgProfileConfig& profileAt(uint8_t index) { return gDeviceConfig.wg[index]
 
 void stopTunnel() {
   if (tunnelInitialized && wireGuardContext.netif != nullptr) {
-    esp_wireguard_disconnect(&wireGuardContext);
+    onLwipThread([] { esp_wireguard_disconnect(&wireGuardContext); });
   }
   tunnelInitialized = false;
   wireGuardContext = ESP_WIREGUARD_CONTEXT_DEFAULT();
@@ -94,13 +147,15 @@ void stopTunnel() {
 
 bool addAllowedRoutes(const WgProfileConfig& profile) {
   for (uint8_t index = 0; index < profile.routeCount; ++index) {
-    const esp_err_t result = esp_wireguard_add_allowed_ip(
-        &wireGuardContext, profile.routes[index].address,
-        profile.routes[index].netmask);
+    esp_err_t result = ESP_FAIL;
+    const WgRouteConfig& route = profile.routes[index];
+    onLwipThread([&] {
+      result = esp_wireguard_add_allowed_ip(&wireGuardContext, route.address,
+                                            route.netmask);
+    });
     if (result != ESP_OK) {
-      Serial.printf("WireGuard: adding IPv4 route %s/%s failed: %d\n",
-                    profile.routes[index].address, profile.routes[index].netmask,
-                    result);
+      eventLogf("WireGuard: adding IPv4 route %s/%s failed: %d", route.address,
+                route.netmask, result);
       return false;
     }
   }
@@ -130,19 +185,20 @@ bool startProfile(uint8_t index) {
     consecutiveFailures = 0;
   }
   handshakeAgeSeconds = UINT32_MAX;
-  Serial.printf("WireGuard: starting profile %u at %s:%u\n", index + 1,
-                profile.endpoint, profile.port);
+  eventLogf("WireGuard: starting profile %u at %s:%u", index + 1, profile.endpoint,
+            profile.port);
 
-  if (esp_wireguard_init(&wireGuardConfig, &wireGuardContext) != ESP_OK) {
-    Serial.printf("WireGuard: profile %u initialization failed\n", index + 1);
+  esp_err_t result = ESP_FAIL;
+  onLwipThread([&] { result = esp_wireguard_init(&wireGuardConfig, &wireGuardContext); });
+  if (result != ESP_OK) {
+    eventLogf("WireGuard: profile %u initialization failed: %d", index + 1, result);
     return false;
   }
   tunnelInitialized = true;
 
-  esp_err_t result;
   const uint32_t connectStartMs = millis();
   do {
-    result = esp_wireguard_connect(&wireGuardContext);
+    onLwipThread([&] { result = esp_wireguard_connect(&wireGuardContext); });
     if (result == ESP_ERR_RETRY) {
       delay(kConnectRetryMs);
     }
@@ -150,62 +206,87 @@ bool startProfile(uint8_t index) {
            millis() - connectStartMs < kConnectDeadlineMs);
 
   if (result == ESP_ERR_RETRY) {
-    Serial.printf("WireGuard: profile %u connect timed out (DNS never resolved?)\n",
-                  index + 1);
+    eventLogf("WireGuard: profile %u connect timed out (DNS never resolved?)",
+              index + 1);
     stopTunnel();
     return false;
   }
   if (result != ESP_OK) {
-    Serial.printf("WireGuard: profile %u connect failed: %d\n", index + 1,
-                  result);
+    eventLogf("WireGuard: profile %u connect failed: %d", index + 1, result);
     stopTunnel();
     return false;
   }
-  // The library hardcodes WIREGUARDIF_MTU (1420); honor the profile's MTU so
-  // TCP MSS matches paths that need a smaller tunnel packet size.
-  if (wireGuardContext.netif != nullptr && profile.mtu > 0) {
-    wireGuardContext.netif->mtu = profile.mtu;
-  }
+
+  esp_err_t defaultRouteResult = ESP_FAIL;
+  onLwipThread([&] {
+    // The library hardcodes WIREGUARDIF_MTU (1420); honor the profile's MTU
+    // so TCP MSS matches paths that need a smaller tunnel packet size.
+    if (wireGuardContext.netif != nullptr && profile.mtu > 0) {
+      wireGuardContext.netif->mtu = profile.mtu;
+    }
+  });
   if (!addAllowedRoutes(profile)) {
     stopTunnel();
     return false;
   }
-  const esp_err_t defaultRouteResult =
-      esp_wireguard_set_default(&wireGuardContext);
+  onLwipThread([&] { defaultRouteResult = esp_wireguard_set_default(&wireGuardContext); });
   if (defaultRouteResult != ESP_OK) {
-    Serial.printf("WireGuard: profile %u default route failed: %d\n", index + 1,
-                  defaultRouteResult);
+    eventLogf("WireGuard: profile %u default route failed: %d", index + 1,
+              defaultRouteResult);
     stopTunnel();
     return false;
   }
 
   profileStartedMs = millis();
+#ifdef BASTION_STACK_DIAG
+  // WireGuard setup now runs on tcpip_thread; verify its (small) stack
+  // still has headroom on this SDK after the heaviest call path above.
+  // ESP-IDF names lwIP's thread "tiT"; upstream lwIP uses "tcpip_thread".
+  TaskHandle_t lwipTask = xTaskGetHandle("tiT");
+  if (lwipTask == nullptr) {
+    lwipTask = xTaskGetHandle("tcpip_thread");
+  }
+  if (lwipTask != nullptr) {
+    eventLogf("WireGuard: tcpip_thread stack headroom %u B",
+              static_cast<unsigned>(uxTaskGetStackHighWaterMark(lwipTask)));
+  }
+#endif
   return true;
 }
 
 bool controlAddressReachable() {
   for (const IPAddress& host : kProbeHosts) {
     WiFiClient client;
-    if (client.connect(host, kProbePort, kProbeTimeoutMs)) {
-      client.stop();
+    const bool ok = client.connect(host, kProbePort, kProbeTimeoutMs);
+    client.stop();
+    if (ok) {
       return true;
     }
-    client.stop();
   }
   return false;
 }
 
 bool tunnelHealthy() {
-  if (!tunnelInitialized || wireGuardContext.netif == nullptr ||
-      esp_wireguard_peer_is_up(&wireGuardContext) != ESP_OK) {
+  if (!tunnelInitialized || wireGuardContext.netif == nullptr) {
     handshakeAgeSeconds = UINT32_MAX;
     return false;
   }
-
+  esp_err_t peerUp = ESP_FAIL;
   time_t latestHandshake = 0;
+  esp_err_t handshakeResult = ESP_FAIL;
+  onLwipThread([&] {
+    peerUp = esp_wireguard_peer_is_up(&wireGuardContext);
+    if (peerUp == ESP_OK) {
+      handshakeResult =
+          esp_wireguard_latest_handshake(&wireGuardContext, &latestHandshake);
+    }
+  });
+  if (peerUp != ESP_OK) {
+    handshakeAgeSeconds = UINT32_MAX;
+    return false;
+  }
   const time_t now = time(nullptr);
-  if (esp_wireguard_latest_handshake(&wireGuardContext, &latestHandshake) != ESP_OK ||
-      now < latestHandshake) {
+  if (handshakeResult != ESP_OK || now < latestHandshake) {
     handshakeAgeSeconds = UINT32_MAX;
     return false;
   }
@@ -219,6 +300,11 @@ void waitForClock() {
   while (WiFi.status() == WL_CONNECTED && time(nullptr) < 1700000000 &&
          millis() - startedMs < 30000) {
     delay(250);
+  }
+  if (time(nullptr) >= 1700000000) {
+    eventLogf("Clock: synchronized over NTP");
+  } else {
+    eventLogf("Clock: NTP sync not yet complete, WireGuard handshake may lag");
   }
 }
 
@@ -235,7 +321,7 @@ void vpnTask(void*) {
 
     if (WiFi.status() != WL_CONNECTED) {
       if (tunnelInitialized) {
-        Serial.println("WireGuard: Wi-Fi lost; stopping tunnel");
+        eventLogf("WireGuard: Wi-Fi lost; stopping tunnel");
         stopTunnel();
       }
       vpnState = VpnState::kWaitingForNetwork;
@@ -287,7 +373,7 @@ void vpnTask(void*) {
 
     if (tunnelHealthy()) {
       if (vpnState != VpnState::kOnline) {
-        Serial.printf("WireGuard: profile %u is online\n", activeProfile + 1);
+        eventLogf("WireGuard: profile %u is online", activeProfile + 1);
       }
       vpnState = VpnState::kOnline;
       consecutiveFailures = 0;
@@ -302,12 +388,11 @@ void vpnTask(void*) {
     }
 
     noteFailure();
-    Serial.printf("WireGuard: profile %u health check failed (%u/%u)\n",
-                  activeProfile + 1, consecutiveFailures.load(),
-                  kFailuresBeforeFailover);
+    eventLogf("WireGuard: profile %u health check failed (%u/%u)", activeProfile + 1,
+              consecutiveFailures.load(), kFailuresBeforeFailover);
     if (profileCount() > 1 && consecutiveFailures >= kFailuresBeforeFailover) {
       desiredProfile = activeProfile == 0 ? 1 : 0;
-      Serial.printf("WireGuard: failing over to profile %u\n", desiredProfile + 1);
+      eventLogf("WireGuard: failing over to profile %u", desiredProfile + 1);
       stopTunnel();
     }
     delay(100);
@@ -318,7 +403,7 @@ void vpnTask(void*) {
 void startRecoveryVpn() {
   if (xTaskCreatePinnedToCore(vpnTask, "recovery-vpn", kTaskStack, nullptr, 3,
                               nullptr, 1) != pdPASS) {
-    Serial.println("WireGuard: failed to create VPN task");
+    eventLogf("WireGuard: failed to create VPN task");
   }
 }
 
@@ -344,9 +429,7 @@ const char* recoveryVpnActiveProfileName() {
 
 uint8_t recoveryVpnActiveProfileNumber() {
   const int8_t index = activeProfile;
-  return (index >= 0 && index < profileCount())
-             ? static_cast<uint8_t>(index + 1)
-             : 0;
+  return (index >= 0 && index < profileCount()) ? static_cast<uint8_t>(index + 1) : 0;
 }
 
 const char* recoveryVpnEndpoint() {
@@ -357,9 +440,8 @@ const char* recoveryVpnEndpoint() {
 
 uint16_t recoveryVpnServerSshPort() {
   const int8_t index = activeProfile;
-  return (index >= 0 && index < profileCount())
-             ? profileAt(index).vpnServerSshPort
-             : 0;
+  return (index >= 0 && index < profileCount()) ? profileAt(index).vpnServerSshPort
+                                                 : 0;
 }
 
 IPAddress recoveryVpnAddress() {

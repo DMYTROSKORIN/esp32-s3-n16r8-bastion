@@ -5,11 +5,14 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <ctype.h>
+#include <esp_task_wdt.h>
 #include <libssh/libssh.h>
 #include <mbedtls/base64.h>
 #include <string.h>
 
 #include "device_config.h"
+#include "event_log.h"
+#include "firmware_info.h"
 #include "portal_html.h"
 #include "wg_conf.h"
 
@@ -35,16 +38,28 @@ bool scanRequested = false;
 // Accumulates {"errors":{"field":"message",...}}. Field names and messages are
 // fixed ASCII strings, so no JSON escaping is needed here.
 struct ErrorList {
-  char json[640];
+  // Every message is short ASCII and there are at most ~12 fields, so 1 KB
+  // holds them all; the reserve below keeps the closing braces from ever
+  // being truncated into invalid JSON should that assumption break.
+  char json[1024];
   size_t length = 0;
   bool any = false;
 
   void add(const char* field, const char* message) {
+    constexpr size_t kReserve = 4;  // Room for "}}" + NUL.
     const int written = snprintf(
-        json + length, sizeof(json) - length, "%s\"%s\":\"%s\"",
+        json + length, sizeof(json) - length - kReserve, "%s\"%s\":\"%s\"",
         any ? "," : "{\"errors\":{", field, message);
-    if (written > 0 && length + written < sizeof(json)) {
+    if (written <= 0) {
+      return;
+    }
+    if (length + written < sizeof(json) - kReserve) {
       length += written;
+    } else {
+      json[length] = '\0';  // Drop the half-written entry, keep the JSON valid.
+      if (!any) {
+        return;
+      }
     }
     any = true;
   }
@@ -94,7 +109,7 @@ void handleNotFound() {
 }
 
 void handleConfig() {
-  static char json[640];
+  static char json[768];
   char ssid[100];
   char wg1[140];
   char wg2[140];
@@ -107,7 +122,8 @@ void handleConfig() {
            "\"pcIp\":\"%s\",\"pcPort\":%u,\"sshUser\":\"%s\","
            "\"sshKeySet\":%s,\"sshKeyType\":\"%s\","
            "\"wg1Set\":%s,\"wg1Endpoint\":\"%s\",\"wg1SshPort\":%u,"
-           "\"wg2Set\":%s,\"wg2Endpoint\":\"%s\",\"wg2SshPort\":%u}",
+           "\"wg2Set\":%s,\"wg2Endpoint\":\"%s\",\"wg2SshPort\":%u,"
+           "\"fw\":\"%s\",\"board\":\"%s\"}",
            deviceConfigPresent() ? "true" : "false", ssid,
            gDeviceConfig.wifiPassword[0] != '\0' ? "true" : "false",
            gDeviceConfig.pcIp, gDeviceConfig.pcPort, gDeviceConfig.sshUser,
@@ -116,7 +132,8 @@ void handleConfig() {
            gDeviceConfig.wgProfileCount >= 1 ? "true" : "false", wg1,
            gDeviceConfig.wg[0].vpnServerSshPort,
            gDeviceConfig.wgProfileCount >= 2 ? "true" : "false", wg2,
-           gDeviceConfig.wg[1].vpnServerSshPort);
+           gDeviceConfig.wg[1].vpnServerSshPort, FIRMWARE_VERSION,
+           FIRMWARE_TARGET_BOARD);
   httpServer.send(200, "application/json", json);
 }
 
@@ -330,6 +347,7 @@ const char* testWifiCredentials(const char* ssid, const char* password,
   const uint32_t startMs = millis();
   wl_status_t status;
   do {
+    esp_task_wdt_reset();  // The trial legitimately runs up to 15 s.
     delay(kPollIntervalMs);
     status = WiFi.status();
   } while (status != WL_CONNECTED && status != WL_CONNECT_FAILED &&
@@ -490,7 +508,7 @@ void handleApply() {
                     "{\"errors\":{\"_\":\"saving to flash failed\"}}");
     return;
   }
-  Serial.println("Portal: settings saved; restarting.");
+  eventLogf("Portal: settings saved; restarting.");
   httpServer.send(200, "application/json", "{\"ok\":true}");
   rebootAtMs = millis() + kRebootDelayMs;
 }
@@ -510,13 +528,13 @@ void setupPortalStart() {
   for (uint8_t attempt = 0; attempt < 3 && !apReady; ++attempt) {
     apReady = WiFi.softAPConfig(kApIp, kApIp, kApMask) && WiFi.softAP(kApName);
     if (!apReady) {
-      Serial.println("Portal: failed to start access point, retrying");
+      eventLogf("Portal: failed to start access point, retrying");
       WiFi.softAPdisconnect(true);
       delay(500);
     }
   }
   if (!apReady) {
-    Serial.println("Portal: could not start access point after retries; rebooting");
+    eventLogf("Portal: could not start access point after retries; rebooting");
     delay(500);
     ESP.restart();
   }
@@ -525,7 +543,7 @@ void setupPortalStart() {
   if (!dnsServer.start(kDnsPort, "*", kApIp)) {
     // Non-fatal: captive-portal auto-popup won't fire, but the HTTP server
     // below is still reachable by navigating to the AP's address directly.
-    Serial.println("Portal: captive DNS failed to start; open http://192.168.4.1/ manually");
+    eventLogf("Portal: captive DNS failed to start; open http://192.168.4.1/ manually");
   }
 
   httpServer.on("/", handleRoot);
@@ -542,8 +560,8 @@ void setupPortalStart() {
   httpServer.onNotFound(handleNotFound);
   httpServer.begin();
 
-  Serial.printf("Portal: open network %s, http://%s/\n", kApName,
-                kApIp.toString().c_str());
+  eventLogf("Portal: open network %s, http://%s/", kApName,
+            kApIp.toString().c_str());
 }
 
 void setupPortalLoop() {

@@ -63,3 +63,7 @@ void deviceConfigMacStore(const uint8_t mac[6]);
 // starts the setup portal pre-filled with the current settings.
 void portalRequestFlagSet();
 bool portalRequestFlagTake();
+
+// Increments and returns the persisted boot counter (diagnostics only; reset
+// together with everything else by a factory reset).
+uint32_t deviceConfigBumpBootCount();
