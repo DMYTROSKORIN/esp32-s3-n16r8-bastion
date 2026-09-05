@@ -34,6 +34,7 @@ memory or flash layout assumes exactly that part:
 | 16 MB flash, QIO @ 80 MHz | `default_16MB.csv`: two 6.25 MB OTA app slots (`app0`/`app1`), 3.4 MB SPIFFS (SSH host key), 64 KB coredump, NVS at 0x9000 (provisioned settings, learned MAC, boot counter). The stock `default_8MB.csv` of the DevKitC-1 board definition would waste half the chip. |
 | 8 MB PSRAM, OPI @ 80 MHz | `board_build.arduino.memory_type = qio_opi`; `heap_caps_malloc_extmem_enable(512)` sends every allocation of 512 B or more to PSRAM, which is what keeps libssh's per-packet buffers from fragmenting the ~320 KB of internal RAM under sustained traffic. The event journal (28 KB) lives there too. Internal RAM is reserved for what must be fast: task stacks, lwIP/Wi-Fi buffers, the two 8 KB relay buffers. |
 | CPU 240 MHz, dual core | Core 0: Wi-Fi driver, lwIP `tcpip_thread`, SSH server task. Core 1: Arduino loop (LED, button, watchdog feed), `net-monitor`, `recovery-vpn`. |
+| Custom-built core | Arduino 3.3.11 / ESP-IDF 5.5.5 (pioarduino 55.03.311) with the IDF libraries rebuilt from source: lwIP TCP window and send buffer 32 KB, receive mailbox 32, SACK, `tcpip_thread` stack 6 KB, 16/64 static/dynamic Wi-Fi RX buffers, 64 TX, BA window 32, Wi-Fi/lwIP hot paths in IRAM, `-O2`. See `custom_sdkconfig` in `platformio.ini`; the legacy environment documents what the stock core gives instead. |
 | Hardware AES / SHA / MPI | mbedTLS uses the S3's accelerators for AES (all SSH ciphers offered), SHA-256/512 (MACs, KEX hashes) and big-number math (ECDH). chacha20-poly1305 is not part of this libssh/mbedTLS build (the Arduino core omits mbedTLS's CHACHAPOLY module) and is not offered - see "SSH throughput" below. |
 
 The boot banner prints what it actually found (`flash 16 MB QIO @ 80 MHz |
@@ -259,31 +260,40 @@ What the firmware does to keep that path fast and, above all, stable:
 - **`-O2`.** libssh, the WireGuard stack and the relay are compiled from
   source; flash is not a constraint on this module.
 
-The remaining ceiling is not in this firmware. lwIP in the prebuilt Arduino
-core has `TCP_WND = TCP_SND_BUF = 5760` bytes, fixed at compile time and not
-adjustable per socket (`ESP_PER_SOC_TCP_WND = 0`). A single TCP connection
-can therefore never have more than 5760 bytes in flight, so its throughput is
-bounded by `5760 B / RTT`:
+- **32 KB TCP window (1.1.0).** lwIP in the *prebuilt* Arduino core has
+  `TCP_WND = TCP_SND_BUF = 5760` bytes, fixed at compile time and not
+  adjustable per socket (`ESP_PER_SOC_TCP_WND = 0`), so a connection could
+  never have more than 5760 bytes in flight and was bounded by `5760 B / RTT`.
+  Since 1.1.0 the default environment rebuilds the IDF libraries
+  (pioarduino HybridCompile, `custom_sdkconfig` in `platformio.ini`) with a
+  32 KB window and send buffer, a 32-segment receive mailbox, SACK and
+  Wi-Fi driver buffers sized to match. The table shows what the window alone
+  allows; the link and CPU are the next limits.
 
-| Path | Typical RTT | Bound per TCP connection |
-|---|---|---|
-| Same LAN | 2-5 ms | 1.1-2.9 MB/s (CPU/crypto-bound in practice) |
-| Through WireGuard, nearby server | 20-30 ms | 190-290 KB/s |
-| Through WireGuard, far server / mobile | 60-100 ms | 58-96 KB/s |
+| Path | Typical RTT | Bound with 5760 B (1.0.0 / legacy env) | Bound with 32 KB (1.1.0) |
+|---|---|---|---|
+| Same LAN | 2-7 ms | 0.8-2.9 MB/s | CPU/link-bound |
+| Through WireGuard, nearby server | 20-30 ms | 190-290 KB/s | 1.1-1.6 MB/s |
+| Through WireGuard, far server / mobile | 60-100 ms | 58-96 KB/s | 330-550 KB/s |
 
 Measured on the LAN bench (2026-09-05, RSSI -73 dBm, loaded RTT ~7 ms, 2 MB
-through `ssh -J` including key exchange): 129-165 KB/s PC → client and
-83-89 KB/s client → PC, versus 105-123 KB/s and 43-44 KB/s for the previous
-firmware on the same board - identical across AES-GCM and AES-CTR, i.e. the
-link and the window, not the crypto, set the pace. Idle round-trip time to the
-board fell from 74 ms to 6.7 ms with the radio kept awake. A 341 s btop soak
-at 500 ms refresh relayed 14.6 MB with a flat heap and a clean exit. For an interactive terminal - even btop at a high
-refresh rate produces tens of KB/s - this is enough; the earlier session drops were caused by
-unbounded buffering and stall handling, not by the window size. Bulk file
-transfer through the bastion is not a design goal. Raising the window means
-rebuilding the Arduino core libraries with a larger
-`CONFIG_LWIP_TCP_WND_DEFAULT` (ESP-IDF lib builder / pioarduino), which is
-listed under "Open decisions".
+through `ssh -J` including key exchange, same board and client throughout):
+
+| Firmware | PC → client | client → PC | Idle RTT |
+|---|---|---|---|
+| e8a9388 (pre-1.0.0) | 105-123 KB/s | 43-44 KB/s | 74 ms (modem-sleep) |
+| 1.0.0, prebuilt core, 5760 B window | 129-165 KB/s | 83-89 KB/s | 6.7 ms |
+| 1.1.0, custom core, 32 KB window | **205-250 KB/s** | **126-270 KB/s** | 6.0 ms |
+
+AES-GCM and AES-CTR measure identically, i.e. the link and the window, not
+the crypto, set the pace. On the LAN the remaining limit is the 2.4 GHz link
+at -73 dBm and per-packet CPU work; through WireGuard the larger window
+matters proportionally more, because a whole btop redraw now fits in one
+round-trip. A 341 s btop soak at 500 ms refresh (1.0.0) relayed 14.6 MB with
+a flat heap and a clean exit; on 1.1.0, btop at its fastest 100 ms refresh
+ran 243 s and 183 s relaying 57 MB and 43 MB at a sustained 235 KB/s, with
+free internal heap never below 85 KB.
+Bulk file transfer through the bastion is still not a design goal.
 
 Commands:
 
@@ -654,13 +664,13 @@ Implemented:
   "Reliability" above). What remains is the library's *internal* behaviour,
   which was always correct: its receive path and timers already ran on
   `tcpip_thread`;
-- `tcpip_thread` has a 2560-byte stack in this Arduino build
-  (`CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`). `esp_wireguard_connect()` now runs
-  there and performs the X25519 key derivation for the new interface. This
-  is the same amount of stack the library's own handshake-response handler
-  already used on that thread before this change, so it introduces no new
-  worst case, but the headroom is not generous. `-DBASTION_STACK_DIAG` logs
-  the high-water mark after each session for verification on new SDKs;
+- `tcpip_thread` has a 2560-byte stack in the *legacy* (prebuilt) build
+  (`CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`); the default 1.1.0 build gives it
+  6144 bytes. `esp_wireguard_connect()` runs there and performs the X25519
+  key derivation for the new interface - the same amount of stack the
+  library's own handshake-response handler already used on that thread, so
+  no new worst case, but on the legacy build the headroom is not generous.
+  `-DBASTION_STACK_DIAG` logs the high-water mark for verification;
 - a narrow race in the ARP lookup (`main_pc.cpp`): after draining a stale
   semaphore token, there remains a theoretical chance that a callback from
   an already-timed-out previous call is still sitting in the
@@ -780,8 +790,6 @@ Lessons from debugging on 2026-08-25/26 — check in this order:
 - an end-to-end test of the ESP32 actually waking the PC via Magic Packet
   (ARP-based MAC learning has already been verified on a live device — see
   "Wake-on-Wireless LAN" above);
-- whether to move to a custom-built Arduino core (ESP-IDF lib builder or
-  pioarduino) solely to raise lwIP's 5760-byte TCP window, which is the only
-  remaining throughput ceiling for remote sessions (see "SSH throughput");
-- whether `tcpip_thread` should get more stack in that same custom build,
-  now that WireGuard setup runs on it.
+- whether the legacy (prebuilt-core) environment should be kept beyond 1.1.x
+  now that the custom-built core is the default, given that every change has
+  to be verified twice while it exists.

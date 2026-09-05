@@ -27,7 +27,7 @@ secondary details and cyan command hints. The `recovery>` prompt is bold
 green.
 
 ```text
-  ESP32 Recovery Gateway  ESP32-S3-N16R8 v1.0.0 · power-on
+  ESP32 Recovery Gateway  ESP32-S3-N16R8 v1.1.0 · power-on
   ────────────────────────────────────────────────
   Device     ● ONLINE    uptime 0d 00:07:44
   Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm  up 0d 00:07:39
@@ -78,7 +78,7 @@ handlers, so this output cannot drift from what the firmware does. The
 actual `help` output in the current firmware:
 
 ```text
-ESP32 Recovery Gateway v1.0.0 - command reference
+ESP32 Recovery Gateway v1.1.0 - command reference
 
 STATUS
   status               Show the complete dashboard

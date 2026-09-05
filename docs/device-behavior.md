@@ -2,7 +2,9 @@
 
 This document describes the **ESP32-S3-N16R8** firmware (16 MB flash, 8 MB
 PSRAM, DevKitC-1 class board with a WS2812 RGB LED on GPIO 48 and the `BOOT`
-button on GPIO 0).
+button on GPIO 0), built on Arduino core 3.3 / ESP-IDF 5.5 with a custom
+sdkconfig since 1.1.0. Behaviour is identical on the legacy prebuilt-core
+build except for network throughput (see the architecture document).
 
 A single onboard RGB LED shows everything needed to bring the ESP32-S3 up
 and diagnose it without a computer or a serial monitor. Color reports the

@@ -58,7 +58,11 @@ From the repo root:
 ~/.platformio/penv/bin/pio run
 ```
 
-The first build downloads and compiles libssh and the WireGuard stack; expect a few minutes.
+The first build downloads the ESP-IDF toolchain and **compiles the whole ESP-IDF from source**
+(pioarduino HybridCompile with the project's `custom_sdkconfig`), then libssh and the WireGuard
+stack: expect 10-20 minutes and a couple of GB under `~/.platformio`. Do not interrupt it; the IDF
+libraries are cached afterwards and later builds take seconds. `pio run -e esp32-s3-n16r8-legacy`
+builds against the stock prebuilt core in about a minute if you only need a quick sanity build.
 A warning about `ssh_message_auth_pubkey`/`ssh_message_auth_publickey_state` being deprecated is
 expected (it's a pre-existing LibSSH-ESP32 API deprecation, not something you introduced) — an
 actual build failure is not. Treat any `error:` line, especially around `std::atomic` copy
@@ -112,7 +116,8 @@ Two outcomes are both "the flash worked, nothing is broken":
 
 - **Normal boot** (existing config still matches the current firmware's layout): you'll see the
   banner `ESP32-S3-N16R8 Bastion v<version> starting (boot #N, reset: ...)`, a `Chip:` line that
-  should read `flash 16 MB QIO @ 80 MHz | PSRAM 8189 KB`, then `Wi-Fi: got IP ...`,
+  should read `flash 16 MB QIO @ 80 MHz | PSRAM 8192 KB | SDK 5.5.5` (8189 KB and `v4.4.7` on the
+  legacy environment), then `Wi-Fi: got IP ...`,
   `Net: ONLINE`, `SSH: listening on ...`, and (if WireGuard profiles are configured)
   `WireGuard: profile N is online`. Nothing further to do — report this back as success. A
   `WARNING:` line about PSRAM or flash size means the board is not an N16R8 — report that.

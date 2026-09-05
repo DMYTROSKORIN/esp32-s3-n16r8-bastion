@@ -8,8 +8,12 @@ on:
 
 jobs:
   build:
-    name: PlatformIO build (esp32-s3-n16r8)
+    name: PlatformIO build (esp32-s3-n16r8, custom core)
     runs-on: ubuntu-latest
+    # The default environment rebuilds the ESP-IDF libraries from source on
+    # the first run (pioarduino HybridCompile); the cache below keeps that to
+    # once per platformio.ini change.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -17,27 +21,31 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Cache PlatformIO packages
+      - name: Cache PlatformIO packages and rebuilt IDF libraries
         uses: actions/cache@v4
         with:
           path: |
             ~/.platformio/packages
             ~/.platformio/platforms
             ~/.cache/pip
-          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          key: pio-idf5-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-idf5-${{ runner.os }}-
 
       - name: Install PlatformIO
         run: pip install --upgrade platformio
 
-      - name: Build
+      - name: Build (default, custom core)
         run: pio run -e esp32-s3-n16r8
+
+      - name: Build (legacy, prebuilt core)
+        run: pio run -e esp32-s3-n16r8-legacy
 
       - name: Report size
         run: |
-          ls -l .pio/build/esp32-s3-n16r8/firmware.bin
-          pio run -e esp32-s3-n16r8 -t size 2>/dev/null | tail -n 5 || true
+          ls -l .pio/build/esp32-s3-n16r8/firmware.bin .pio/build/esp32-s3-n16r8-legacy/firmware.bin
 
-      - name: Upload firmware artifact
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
           name: esp32-s3-n16r8-bastion-${{ github.sha }}
@@ -45,4 +53,5 @@ jobs:
             .pio/build/esp32-s3-n16r8/firmware.bin
             .pio/build/esp32-s3-n16r8/bootloader.bin
             .pio/build/esp32-s3-n16r8/partitions.bin
+            .pio/build/esp32-s3-n16r8-legacy/firmware.bin
           if-no-files-found: error

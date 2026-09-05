@@ -3,3 +3,9 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch/
+
+# pioarduino HybridCompile artefacts (generated from custom_sdkconfig)
+.dummy/
+managed_components/
+sdkconfig.esp32-s3-n16r8*
+sdkconfig.defaults

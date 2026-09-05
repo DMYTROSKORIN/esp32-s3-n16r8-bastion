@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-09-05
+
+### Changed
+
+- **Custom-built core.** The default environment now uses the
+  [pioarduino](https://github.com/pioarduino/platform-espressif32) platform
+  (release 55.03.311: Arduino core 3.3.11 on ESP-IDF 5.5.5) in its
+  "HybridCompile" mode: `custom_sdkconfig` in `platformio.ini` rebuilds the
+  IDF libraries from source with this project's settings. The first build
+  compiles the whole IDF (~6 min on 16 cores, longer on CI); later builds
+  reuse the cached libraries. The board is the exact `esp32-s3-devkitc1-n16r8`
+  definition shipped by pioarduino.
+- **lwIP TCP window 5760 → 32768 bytes** (`CONFIG_LWIP_TCP_WND_DEFAULT`,
+  `CONFIG_LWIP_TCP_SND_BUF_DEFAULT`), receive mailbox 6 → 32 segments, SACK
+  on, `tcpip_thread` stack 2560 → 6144 bytes, Wi-Fi driver buffers sized to
+  match (16 static / 64 dynamic RX, 64 dynamic TX, BA window 32), Wi-Fi and
+  lwIP hot paths in IRAM, IDF libraries at `-O2`. This removes the throughput
+  ceiling documented in 1.0.0.
+- Watchdog set-up uses the ESP-IDF 5 API (`esp_task_wdt_reconfigure`) when
+  built on IDF 5; the IDF 4 path is kept for the legacy environment.
+- `esp32-s3-n16r8-legacy` environment keeps the 1.0.0 build (official
+  PlatformIO `espressif32 @ 7.0.1`, prebuilt core, 5760-byte window) as an
+  escape hatch and for A/B comparisons.
+- LibSSH-ESP32's reference X25519 and libsodium's (via WireGuard) both define
+  `crypto_scalarmult`; the IDF 5 link tolerates the duplicate
+  (`-Wl,--allow-multiple-definition`, both are equivalent implementations).
+
+### Measured (same LAN bench as 1.0.0, same board, RSSI -73 dBm)
+
+| Metric | 1.0.0 (prebuilt core, 5760 B window) | 1.1.0 (custom core, 32 KB window) |
+|---|---|---|
+| Relay PC → client, 2 MB via `ssh -J` | 129-165 KB/s | **205-250 KB/s** |
+| Relay client → PC, 2 MB via `ssh -J` | 83-89 KB/s | **126-270 KB/s** |
+| btop soak via `ssh -J`, 200x50, **100 ms** refresh | - | 243 s / 57 MB / 235 KB/s and 183 s / 43 MB / 237 KB/s sustained, clean exits |
+| ICMP RTT idle | 6.7 ms | 6.0 ms |
+| Free internal heap, idle, VPN up | 189 KB | 121 KB (min 94 KB during the soak) |
+
+Both directions are now limited by the Wi-Fi link and CPU rather than by the
+TCP window; through WireGuard (30-60 ms RTT) the gain is proportionally larger,
+because 32 KB in flight covers a whole btop redraw in one round-trip. The
+lower internal heap is the ESP-IDF 5 baseline plus the larger static Wi-Fi
+buffers; the dynamic Wi-Fi/lwIP pools live in PSRAM
+(`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`, off in pioarduino's defaults). The
+spread in the client → PC figures is Wi-Fi run-to-run variance at -73 dBm.
+
 ## [1.0.0] - 2026-09-05
 
 First versioned release. The firmware is now explicitly tuned for, and only

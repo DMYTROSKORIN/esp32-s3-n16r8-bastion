@@ -3,6 +3,7 @@
 #include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <esp_idf_version.h>
 #include <esp_task_wdt.h>
 #include <esp_wifi.h>
 #include <math.h>
@@ -400,7 +401,19 @@ void setup() {
   logBootBanner(bootCount);
 
   // Watchdog on the loop task; the net-monitor task subscribes itself.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+  // ESP-IDF 5: the core already started the TWDT (idle tasks); reconfigure
+  // its timeout instead of re-initialising it.
+  esp_task_wdt_config_t watchdogConfig = {};
+  watchdogConfig.timeout_ms = kWatchdogTimeoutSeconds * 1000UL;
+  watchdogConfig.idle_core_mask = (1 << 0);
+  watchdogConfig.trigger_panic = true;
+  if (esp_task_wdt_reconfigure(&watchdogConfig) != ESP_OK) {
+    esp_task_wdt_init(&watchdogConfig);
+  }
+#else
   esp_task_wdt_init(kWatchdogTimeoutSeconds, true);
+#endif
   esp_task_wdt_add(nullptr);
 
   deviceConfigLoad();

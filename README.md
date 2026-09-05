@@ -5,7 +5,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.0.0-2ea44f.svg"></a>
+  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.1.0-2ea44f.svg"></a>
   <a href=".github/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/DMYTROSKORIN/esp32-s3-n16r8-bastion/build.yml?branch=main&label=build"></a>
   <img alt="Platform" src="https://img.shields.io/badge/board-ESP32--S3--N16R8%20only-e07020.svg">
   <img alt="Framework" src="https://img.shields.io/badge/framework-Arduino%20%2F%20PlatformIO-00979d.svg">
@@ -49,7 +49,7 @@ quad-SPI flash** and **8 MB octal PSRAM**, on a DevKitC-1 class board (WS2812 RG
 | PSRAM | 8 MB OPI (`memory_type = qio_opi`), allocations ≥ 512 B go there | libssh's per-packet buffers stop fragmenting the ~320 KB internal heap under btop-class traffic; the event journal lives there too |
 | CPU | 240 MHz, both cores in use | Wi-Fi/lwIP/SSH on core 0; LED, network monitor and WireGuard on core 1 |
 | Crypto | hardware AES, SHA, big-number unit | only AES ciphers are offered over SSH, all hardware-accelerated; chacha20 is not part of this libssh/mbedTLS build |
-| Build | `-O2`, platform pinned to `espressif32 @ 7.0.1` | libssh and WireGuard are compiled from source; flash size is not a constraint |
+| Core | pioarduino 55.03.311 (Arduino 3.3.11 / ESP-IDF 5.5.5), IDF libraries rebuilt from source with `custom_sdkconfig` | lwIP TCP window 32 KB instead of the prebuilt core's 5760 B, SACK, 6 KB `tcpip_thread` stack, Wi-Fi/lwIP hot paths in IRAM, everything at `-O2` |
 
 The boot log prints what it found (`flash 16 MB QIO @ 80 MHz | PSRAM 8189 KB`) and warns if the
 chip is not an N16R8. Other ESP32-S3 variants (N8R2, N16R2, N8…) are **not supported** by this
@@ -61,7 +61,7 @@ before attempting a port.
 The SSH console opens straight into a live status dashboard — no separate monitoring needed:
 
 ```text
-  ESP32 Recovery Gateway  ESP32-S3-N16R8 v1.0.0 · power-on
+  ESP32 Recovery Gateway  ESP32-S3-N16R8 v1.1.0 · power-on
   ────────────────────────────────────────────────
   Device     ● ONLINE    uptime 0d 00:07:44
   Wi-Fi      ● ONLINE    MyHomeWiFi  -51 dBm  up 0d 00:07:39
@@ -87,6 +87,13 @@ A single onboard RGB LED mirrors the same state without a computer in reach at a
 Open the directory in VS Code with the PlatformIO extension, then use the PlatformIO **Upload**
 action (or `pio run -t upload` / `pio run -t upload -t monitor`). The serial monitor runs at
 115200 baud; PlatformIO auto-detects the upload port.
+
+The default environment builds the ESP-IDF libraries from source with this project's `sdkconfig`
+overrides (pioarduino "HybridCompile"), which is what lifts lwIP's TCP window from 5760 bytes to
+32 KB. The **first build downloads the IDF toolchain and compiles the IDF once — expect 10-20
+minutes**; later builds take seconds until `custom_sdkconfig` changes. `pio run -e
+esp32-s3-n16r8-legacy` builds the same firmware on the stock prebuilt core in under a minute, with
+the old 5760-byte window, if you need a quick fallback.
 
 Handing this off to an AI coding agent (Claude Code, Codex CLI, etc.) instead? Point it at
 [docs/agent-flashing.md](docs/agent-flashing.md) — it covers finding the port, building, flashing,
@@ -142,9 +149,12 @@ The relay is built for sustained TUI traffic, not just keystrokes:
   ~70 ms (9-140 ms jitter) to ~6 ms, which is the difference between a laggy and a crisp console
   (`-DBASTION_WIFI_POWER_SAVE=1` restores modem-sleep).
 
-One ceiling remains and is documented rather than hidden: the prebuilt Arduino core fixes lwIP's
-TCP window at 5760 bytes, so a single connection is bounded by roughly `5760 B / RTT` — plenty on
-the LAN and for interactive use over WireGuard, but not a file-transfer path. Details and numbers in
+- **32 KB TCP window.** The prebuilt Arduino core fixes lwIP's window at 5760 bytes, which capped a
+  connection at `5760 B / RTT` (~160 KB/s on the LAN, under 200 KB/s over WireGuard). Since 1.1.0 the
+  IDF libraries are rebuilt with a 32 KB window, SACK and matching Wi-Fi buffers: on the same bench
+  the relay went from 129-165 to 234-246 KB/s downstream and from 83-89 to 187-270 KB/s upstream.
+
+Details, the measurement method and the remaining limits are in
 [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md#ssh-throughput-on-the-esp32-s3).
 
 ## Provisioning (Wi-Fi, PC, SSH key, WireGuard)
@@ -225,8 +235,8 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 | | |
 |---|---|
 | Board | **ESP32-S3-N16R8** (16 MB QIO flash, 8 MB OPI PSRAM), DevKitC-1 class — the only supported variant |
-| Firmware | v1.0.0 — see [CHANGELOG.md](CHANGELOG.md) |
-| Framework | Arduino core for ESP32 2.0.17 (ESP-IDF 4.4.7), PlatformIO `espressif32 @ 7.0.1`, `-O2` |
+| Firmware | v1.1.0 — see [CHANGELOG.md](CHANGELOG.md) |
+| Framework | Arduino core 3.3.11 / ESP-IDF 5.5.5 via [pioarduino](https://github.com/pioarduino/platform-espressif32) 55.03.311, IDF rebuilt with `custom_sdkconfig`, `-O2`; legacy env on `espressif32 @ 7.0.1` (Arduino 2.0.17) |
 | CI | [GitHub Actions](.github/workflows/build.yml) builds every push and uploads the binaries |
 | SSH server | [LibSSH-ESP32](https://github.com/ewpa/LibSSH-ESP32) (Arduino port of libssh) |
 | WireGuard client | [esphome-libs/wireguard](https://github.com/esphome-libs/wireguard) (`esp_wireguard`/`wireguardif`) |
@@ -238,8 +248,6 @@ This is a personal-infrastructure project first, but issues and pull requests ar
 particular around:
 
 - A/B OTA updates with automatic rollback (the 16 MB partition table already has both slots)
-- A custom Arduino core build with a larger lwIP TCP window (the one remaining throughput ceiling
-  for remote sessions — see the architecture document)
 - Hardening for production deployment (Secure Boot V2, Flash Encryption, per-device signing)
 
 Please keep the runtime-provisioning model intact — no secrets should ever need to be baked into
