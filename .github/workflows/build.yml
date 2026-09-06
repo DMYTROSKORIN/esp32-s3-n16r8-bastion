@@ -31,9 +31,12 @@ jobs:
             ~/.platformio/packages
             ~/.platformio/platforms
             ~/.cache/pip
+          # Exact key only: pioarduino's HybridCompile keeps the rebuilt IDF
+          # libraries inside the package directory, and reusing a cache made
+          # for a different platformio.ini (different custom_sdkconfig) sends
+          # it down a "Reinstall Arduino framework" path that crashes. A
+          # config change therefore costs one clean install (~10 min).
           key: pio-idf5-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
-          restore-keys: |
-            pio-idf5-${{ runner.os }}-
 
       - name: Install PlatformIO and signing dependencies
         # Pinned: pioarduino's HybridCompile step (rebuilding the IDF libraries
