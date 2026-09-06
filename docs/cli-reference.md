@@ -27,7 +27,7 @@ white for the facts you act on and cyan for labels and command hints. The
 `recovery>` prompt is bold green.
 
 ```text
-  ESP32 Recovery Gateway   v1.2.0   ESP32-S3-N16R8  • reset: power-on
+  ESP32 Recovery Gateway   v1.3.0   ESP32-S3-N16R8  • reset: power-on
   ──────────────────────────────────────────────────────────────────────────────
   Device     ● ONLINE     up 0d 00:07:44
   Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
@@ -36,7 +36,7 @@ white for the facts you act on and cyan for labels and command hints. The
   Main PC    ● ONLINE     192.168.1.200:22  ssh open
   WoWLAN     ● STANDBY    aa:bb:cc:dd:ee:ff
   Memory     ● OK         heap 121 KB (min 114)  psram 8117/8192 KB
-  Firmware   ● CONFIRMED  slot app0  sessions 3
+  Firmware   ● CONFIRMED  slot app0  sessions 1/3 active, 3 total
   ──────────────────────────────────────────────────────────────────────────────
   help commands   pc ssh reach the PC   pc wake wake it up   ota update
 
@@ -79,9 +79,10 @@ Line behavior:
   (a steadily sinking minimum is the early sign of a leak) and free/total
   PSRAM; the state word is `OK` / `TIGHT` / `LOW` for a minimum above
   80 KB / above 50 KB / below.
-- `Firmware` shows the running OTA slot, the number of SSH sessions
-  authenticated since boot, and `SELF-TEST` (yellow) while a freshly
-  installed image is still proving itself - see `ota` below.
+- `Firmware` shows the running OTA slot, how many sessions are active out
+  of the maximum and how many have authenticated since boot, and
+  `SELF-TEST` (yellow) while a freshly installed image is still proving
+  itself - see `ota` below.
 
 ## Top-level help
 
@@ -92,7 +93,7 @@ handlers, so this output cannot drift from what the firmware does. The
 actual `help` output in the current firmware:
 
 ```text
-ESP32 Recovery Gateway v1.2.0 - command reference
+ESP32 Recovery Gateway v1.3.0 - command reference
 
 STATUS
   status               Show the complete dashboard
@@ -154,7 +155,7 @@ The console is a small line editor, not a raw byte sink:
 | Key | Effect |
 |---|---|
 | `Backspace` | delete the last character |
-| `↑` / `↓` | recall the previous / next command (8 entries, kept across sessions until reboot) |
+| `↑` / `↓` | recall the previous / next command (8 entries, per session) |
 | `Ctrl+C` | discard the current input line |
 | `Ctrl+U` | clear the current input line |
 | `Ctrl+L` | clear the screen and redraw the prompt |
@@ -378,11 +379,18 @@ Implemented:
 - The SSH bastion only permits the `<PC IP>:<PC port>` destination from
   the current configuration; a request for any other `direct-tcpip`
   destination is rejected and journaled.
-- The server handles one session at a time. While a relayed tunnel to
-  the PC is open, the console is unavailable (and vice versa). One
-  channel per session: `ssh -J` opens exactly one `direct-tcpip` channel,
-  which is the supported pattern; multiplexed sessions (`ControlMaster`,
-  several `-L` forwards on one connection) are not.
+- Up to three sessions run at the same time (console, relay, or any
+  mix), each on its own task. A fourth client is let in as far as
+  authentication; once it has proven it holds the authorized key, the
+  oldest authenticated session is closed with `Session closed: replaced by
+  a newer login from <address>` - so a hung or forgotten client can never
+  lock the owner out, while nobody without the key can displace anyone. A
+  fifth simultaneous connection is refused immediately (the client sees
+  the connection close instead of waiting for a banner). One channel per
+  session: `ssh -J` opens exactly one `direct-tcpip` channel, which is the
+  supported pattern; multiplexed sessions (`ControlMaster`, several `-L`
+  forwards on one connection) are not. The legacy prebuilt-core build
+  stays single-session (its mbedTLS has no locking).
 - Protection against stalled clients: a 30 s libssh I/O timeout on the
   session (covers a stall during key exchange or authentication) plus
   TCP keepalive as a backstop for a client that vanishes without a FIN;

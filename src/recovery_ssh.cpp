@@ -13,6 +13,7 @@
 #include <lwip/sockets.h>
 #include <atomic>
 #include <errno.h>
+#include <sdkconfig.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -30,12 +31,11 @@ constexpr char kHostKeyFsPath[] = "/ssh_host_ed25519_key";
 constexpr char kHostKeyVfsPath[] = "/spiffs/ssh_host_ed25519_key";
 constexpr char kBindAddress[] = "0.0.0.0";
 constexpr char kBindPort[] = "22";
-// libssh's key exchange (curve25519 + Ed25519 signature) and the per-packet
-// crypto run on this task's stack. Measured peak use is ~6.5 KB (32 KB stack
-// left 25.6 KB untouched after KEX + auth + a 4 MB relay on 2026-09-05, see
-// BASTION_STACK_DIAG); 20 KB keeps a 3x margin for RSA client keys and
-// future libssh versions while returning 12 KB of internal RAM to the heap.
-constexpr uint32_t kSshTaskStack = 20480;
+// The acceptor runs ssh_bind_accept(), which (re)imports the host key for
+// every accepted connection - file I/O plus key parsing - before handing the
+// session to its own task. 6 KB was not enough: the overflow corrupted
+// FreeRTOS kernel lists and crashed unrelated tasks seconds after boot.
+constexpr uint32_t kSshTaskStack = 16384;
 
 // The server handles one session at a time, so every blocking libssh call must
 // be bounded: a stalled or vanished client would otherwise wedge the recovery
@@ -96,16 +96,108 @@ constexpr char kAnsiBoldCyan[] = "\x1b[1;36m";
 constexpr char kPrompt[] = "\x1b[1;32mrecovery>\x1b[0m ";
 constexpr char kClearScreen[] = "\x1b[2J\x1b[H";
 
+void channelPrintf(ssh_channel channel, const char* format, ...)
+    __attribute__((format(printf, 2, 3)));
+void channelWrite(ssh_channel channel, const char* text);
+
 ssh_key authorizedKey = nullptr;
 char authorizedKeyFingerprint[64] = "unknown";
-// Columns reported by the client's pty-req / window-change; the dashboard
-// draws its rules to this width (clamped) instead of a fixed 48 columns.
-std::atomic<int> terminalColumns{80};
-uint8_t* relayToPc = nullptr;
-uint8_t* relayToClient = nullptr;
 std::atomic<uint32_t> sessionsServed{0};
 std::atomic<uint32_t> authFailures{0};
-char peerAddress[48] = "-";
+
+// ---------------------------------------------------------------------------
+// Session pool
+//
+// Up to kMaxSessions authenticated sessions run concurrently, each on its own
+// FreeRTOS task with its own libssh session. One extra slot exists so that a
+// newcomer can always get as far as authentication while all regular slots
+// are busy; once it has proven it holds the authorized key, the OLDEST
+// authenticated session is told to leave ("replaced by a newer login"). An
+// unauthenticated newcomer evicts nobody - otherwise anyone on the LAN or
+// VPN could knock the owner out with a few bare TCP connections. A 5th
+// simultaneous connection is refused immediately instead of being left
+// waiting for a banner that never comes.
+//
+// libssh shares one mbedTLS CTR-DRBG between all sessions (every packet's
+// padding draws from it), so concurrent sessions need mbedTLS's internal
+// locking: the default (IDF 5) build enables CONFIG_MBEDTLS_THREADING_C in
+// custom_sdkconfig. The legacy prebuilt core has no such locking and stays
+// single-session.
+// ---------------------------------------------------------------------------
+#if defined(CONFIG_MBEDTLS_THREADING_C)
+constexpr uint8_t kMaxSessions = 3;
+#else
+constexpr uint8_t kMaxSessions = 1;
+#endif
+constexpr uint8_t kSessionSlots = kMaxSessions + 1;
+// Measured with BASTION_STACK_DIAG on 2026-09-06: peak use 5.4 KB per session
+// (RSA client key, KEX + auth + a 1 MB relay + an HTTPS OTA attempt, which
+// keeps its TLS state on the heap). 12 KB leaves a 2.2x margin while keeping
+// four slots' worth of stacks at 48 KB of internal RAM.
+constexpr uint32_t kSessionTaskStack = 12288;
+
+struct SshSessionContext {
+  std::atomic<bool> inUse{false};
+  std::atomic<bool> authenticated{false};
+  std::atomic<bool> evict{false};
+  std::atomic<int> columns{80};  // From pty-req / window-change.
+  ssh_session session = nullptr;
+  uint32_t startedMs = 0;
+  char peer[48] = "-";
+  char evictedBy[48] = "";
+  // Relay/OTA buffers, allocated on first use from PSRAM (the TCP window,
+  // not memcpy speed, bounds the relay) and freed when the session ends.
+  uint8_t* bufToPc = nullptr;
+  uint8_t* bufToClient = nullptr;
+};
+
+SshSessionContext sessions[kSessionSlots];
+SemaphoreHandle_t sessionsMutex = nullptr;
+// Each session task works on exactly one context; the handlers below reach
+// it through this pointer instead of threading it through every signature.
+thread_local SshSessionContext* currentSession = nullptr;
+
+const char* peerName() { return currentSession != nullptr ? currentSession->peer : "-"; }
+
+bool sessionEvicted() {
+  return currentSession != nullptr && currentSession->evict.load();
+}
+
+uint8_t activeSessionCount() {
+  uint8_t count = 0;
+  for (SshSessionContext& ctx : sessions) {
+    if (ctx.inUse.load() && ctx.authenticated.load()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+bool ensureRelayBuffers() {
+  SshSessionContext* ctx = currentSession;
+  if (ctx->bufToPc == nullptr) {
+    ctx->bufToPc = static_cast<uint8_t*>(
+        heap_caps_malloc(kRelayBufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  }
+  if (ctx->bufToClient == nullptr) {
+    ctx->bufToClient = static_cast<uint8_t*>(
+        heap_caps_malloc(kRelayBufferSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  }
+  if (ctx->bufToPc == nullptr) {
+    ctx->bufToPc = static_cast<uint8_t*>(malloc(kRelayBufferSize));
+  }
+  if (ctx->bufToClient == nullptr) {
+    ctx->bufToClient = static_cast<uint8_t*>(malloc(kRelayBufferSize));
+  }
+  return ctx->bufToPc != nullptr && ctx->bufToClient != nullptr;
+}
+
+void writeEvictionNotice(ssh_channel channel) {
+  channelPrintf(channel,
+                "\r\n%sSession closed: replaced by a newer login from %s "
+                "(the console keeps the %u most recent sessions).%s\r\n",
+                kAnsiYellow, currentSession->evictedBy, kMaxSessions, kAnsiReset);
+}
 
 // ---------------------------------------------------------------------------
 // Channel output helpers
@@ -210,7 +302,7 @@ void formatUptime(char* output, size_t outputSize) {
 
 // A horizontal rule as wide as the client's terminal (clamped to 48..100).
 void writeRule(ssh_channel channel) {
-  int width = terminalColumns.load() - 2;
+  int width = (currentSession != nullptr ? currentSession->columns.load() : 80) - 2;
   width = width < 48 ? 48 : (width > 100 ? 100 : width);
   char line[3 * 100 + 8];  // "─" is 3 bytes in UTF-8.
   size_t used = 0;
@@ -328,8 +420,9 @@ void writeDashboard(ssh_channel channel) {
 
   const bool selfTest = otaSelfTestPending();
   const esp_partition_t* running = esp_ota_get_running_partition();
-  snprintf(detail, sizeof(detail), "slot %s%s%s  sessions %lu  %s", kAnsiWhite,
-           running != nullptr ? running->label : "?", kAnsiReset,
+  snprintf(detail, sizeof(detail), "slot %s%s%s  sessions %u/%u active, %lu total  %s",
+           kAnsiWhite, running != nullptr ? running->label : "?", kAnsiReset,
+           activeSessionCount(), kMaxSessions,
            static_cast<unsigned long>(sessionsServed.load()),
            selfTest ? "confirming this image (Wi-Fi + SSH up) ..." : "");
   statusRow(channel, "Firmware", selfTest ? kAnsiYellow : kAnsiGreen,
@@ -527,6 +620,10 @@ bool cmdWatch(ssh_channel channel, const char*) {
     if (available < 0) {
       return false;
     }
+    if (sessionEvicted()) {
+      writeEvictionNotice(channel);
+      return false;
+    }
     if (available > 0) {
       char scratch[64];
       ssh_channel_read_nonblocking(channel, scratch, sizeof(scratch), 0);
@@ -698,14 +795,14 @@ bool cmdVpnStatus(ssh_channel channel, const char*) {
 
 bool cmdVpnFailover(ssh_channel channel, const char*) {
   recoveryVpnRequestFailover();
-  eventLogf("SSH: vpn failover requested by %s", peerAddress);
+  eventLogf("SSH: vpn failover requested by %s", peerName());
   channelWrite(channel, "\r\nVPN failover requested. Run 'vpn status' shortly.\r\n");
   return true;
 }
 
 bool cmdVpnRetryPrimary(ssh_channel channel, const char*) {
   recoveryVpnRequestPrimary();
-  eventLogf("SSH: vpn retry-primary requested by %s", peerAddress);
+  eventLogf("SSH: vpn retry-primary requested by %s", peerName());
   channelWrite(channel, "\r\nPrimary VPN retry requested. Run 'vpn status' shortly.\r\n");
   return true;
 }
@@ -715,7 +812,7 @@ bool cmdReboot(ssh_channel channel, const char* args) {
     channelWrite(channel, "\r\nReboot the ESP32 now? Type `reboot yes` to confirm.\r\n");
     return true;
   }
-  eventLogf("SSH: reboot requested by %s", peerAddress);
+  eventLogf("SSH: reboot requested by %s", peerName());
   channelWrite(channel, "\r\nRebooting. Reconnect in ~10 seconds.\r\n");
   ssh_channel_send_eof(channel);
   ssh_channel_close(channel);
@@ -739,7 +836,7 @@ void finishOtaAndReboot(ssh_channel channel, const OtaResult& result) {
                 "once Wi-Fi + SSH are up, otherwise the bootloader rolls back.\r\n",
                 result.message, FIRMWARE_VERSION);
   eventLogf("OTA: rebooting into %s (v%s) requested by %s", result.targetLabel,
-            result.version, peerAddress);
+            result.version, peerName());
   ssh_channel_request_send_exit_status(channel, 0);
   ssh_channel_send_eof(channel);
   ssh_channel_close(channel);
@@ -779,7 +876,7 @@ bool cmdOta(ssh_channel channel, const char* args) {
   }
   if (strncmp(args, "https://", 8) == 0) {
     channelPrintf(channel, "\r\nFetching %s\r\n", args);
-    eventLogf("OTA: download requested by %s", peerAddress);
+    eventLogf("OTA: download requested by %s", peerName());
     OtaResult result;
     if (!otaFromUrl(args, otaReportToChannel, channel, result)) {
       channelPrintf(channel, "\r\nUpdate failed: %s\r\nThe running firmware is unchanged.\r\n",
@@ -800,7 +897,13 @@ bool cmdOta(ssh_channel channel, const char* args) {
 // on stdout and a non-zero exit status on failure.
 void receiveOtaFromChannel(ssh_channel channel) {
   constexpr uint32_t kUploadIdleTimeoutMs = 60000;
-  eventLogf("OTA: upload over SSH from %s", peerAddress);
+  eventLogf("OTA: upload over SSH from %s", peerName());
+  if (!ensureRelayBuffers()) {
+    channelWrite(channel, "OTA cannot start: out of memory.\r\n");
+    ssh_channel_request_send_exit_status(channel, 1);
+    return;
+  }
+  uint8_t* const relayToPc = currentSession->bufToPc;
   OtaSink sink;
   OtaResult result;
   if (!sink.begin(result)) {
@@ -813,6 +916,12 @@ void receiveOtaFromChannel(ssh_channel channel) {
   size_t lastReported = 0;
   while (true) {
     const int count = ssh_channel_read_timeout(channel, relayToPc, kRelayBufferSize, 0, 1000);
+    if (sessionEvicted()) {
+      channelWrite(channel, "Transfer aborted: session replaced by a newer login. Nothing was changed.\r\n");
+      sink.abort();
+      ssh_channel_request_send_exit_status(channel, 1);
+      return;
+    }
     if (count == SSH_ERROR) {
       channelWrite(channel, "Transfer failed (channel error). Nothing was changed.\r\n");
       sink.abort();
@@ -862,7 +971,7 @@ void runExecCommand(ssh_channel channel, const String& command) {
     receiveOtaFromChannel(channel);
     return;
   }
-  eventLogf("SSH: exec '%s' from %s", trimmed.c_str(), peerAddress);
+  eventLogf("SSH: exec '%s' from %s", trimmed.c_str(), peerName());
   executeCommand(channel, trimmed);
   ssh_channel_request_send_exit_status(channel, 0);
 }
@@ -1031,11 +1140,15 @@ void serveShell(ssh_channel channel) {
   writeDashboard(channel);
   channelWrite(channel, kPrompt);
 
-  static LineEditor editor;  // Persists history across sessions.
+  LineEditor editor;  // Per session; history lives as long as the session.
   editor.reset();
   uint32_t lastActivityMs = millis();
   while (ssh_channel_is_open(channel) && !ssh_channel_is_eof(channel)) {
     const int available = ssh_channel_poll_timeout(channel, 1000, 0);
+    if (sessionEvicted()) {
+      writeEvictionNotice(channel);
+      return;
+    }
     if (available == 0) {
       if (millis() - lastActivityMs > kShellIdleTimeoutMs) {
         channelWrite(channel, "\r\nIdle timeout. Bye.\r\n");
@@ -1168,6 +1281,14 @@ int connectToPc() {
 }
 
 void relayDirectTcpip(ssh_channel channel, ssh_session session) {
+  if (!ensureRelayBuffers()) {
+    eventLogf("Relay: out of memory for buffers");
+    ssh_channel_send_eof(channel);
+    ssh_channel_close(channel);
+    return;
+  }
+  uint8_t* const relayToPc = currentSession->bufToPc;
+  uint8_t* const relayToClient = currentSession->bufToClient;
   const int pcFd = connectToPc();
   if (pcFd < 0) {
     eventLogf("Relay: %s:%u refused/unreachable", gDeviceConfig.pcIp,
@@ -1226,6 +1347,10 @@ void relayDirectTcpip(ssh_channel channel, ssh_session session) {
       wait.tv_sec = 1;
     }
     const int ready = select(maxFd + 1, &readable, nullptr, nullptr, &wait);
+    if (sessionEvicted()) {
+      closeReason = "replaced by a newer login";
+      break;
+    }
     if (ready < 0 && errno != EINTR) {
       // EBADF here is the normal end of a session: the client tore down the
       // TCP connection and libssh closed its socket underneath us.
@@ -1357,20 +1482,6 @@ bool ensureHostKey() {
   return true;
 }
 
-void describePeer(ssh_session session) {
-  snprintf(peerAddress, sizeof(peerAddress), "unknown");
-  const socket_t fd = ssh_get_fd(session);
-  if (fd == SSH_INVALID_SOCKET) {
-    return;
-  }
-  sockaddr_in address = {};
-  socklen_t length = sizeof(address);
-  if (getpeername(fd, reinterpret_cast<sockaddr*>(&address), &length) == 0) {
-    snprintf(peerAddress, sizeof(peerAddress), "%s:%u",
-             inet_ntoa(address.sin_addr), ntohs(address.sin_port));
-  }
-}
-
 void hardenSessionTransport(ssh_session session) {
   long timeoutSeconds = kSessionIoTimeoutSeconds;
   ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeoutSeconds);
@@ -1434,7 +1545,7 @@ bool authenticateSession(ssh_session session) {
 
 void handleAuthenticatedSession(ssh_session session) {
   const uint32_t startedMs = millis();
-  while (millis() - startedMs < kPreShellDeadlineMs) {
+  while (millis() - startedMs < kPreShellDeadlineMs && !sessionEvicted()) {
     ssh_message message = ssh_message_get(session);
     if (message == nullptr) {
       return;
@@ -1467,7 +1578,7 @@ void handleAuthenticatedSession(ssh_session session) {
               if (requestType != SSH_CHANNEL_REQUEST_ENV) {
                 const int columns = ssh_message_channel_request_pty_width(request);
                 if (columns > 0) {
-                  terminalColumns = columns;
+                  currentSession->columns = columns;
                 }
               }
               ssh_message_channel_request_reply_success(request);
@@ -1488,7 +1599,7 @@ void handleAuthenticatedSession(ssh_session session) {
           ssh_message_free(request);
         }
         if (shellRequested) {
-          eventLogf("SSH: console session from %s", peerAddress);
+          eventLogf("SSH: console session from %s", peerName());
           serveShell(channel);
         } else if (execRequested) {
           runExecCommand(channel, execCommand);
@@ -1507,7 +1618,7 @@ void handleAuthenticatedSession(ssh_session session) {
           ssh_channel channel = ssh_message_channel_request_open_reply_accept(message);
           ssh_message_free(message);
           if (channel != nullptr) {
-            eventLogf("SSH: bastion relay from %s to %s:%d", peerAddress,
+            eventLogf("SSH: bastion relay from %s to %s:%d", peerName(),
                       destination, destinationPort);
             relayDirectTcpip(channel, session);
             ssh_channel_free(channel);
@@ -1516,7 +1627,7 @@ void handleAuthenticatedSession(ssh_session session) {
         }
         eventLogf("SSH: rejected direct-tcpip to %s:%d from %s",
                   destination != nullptr ? destination : "?", destinationPort,
-                  peerAddress);
+                  peerName());
       }
     }
 
@@ -1572,25 +1683,111 @@ bool configureAndListen(ssh_bind bind) {
   return true;
 }
 
-uint8_t* allocateRelayBuffer() {
-  uint8_t* buffer = static_cast<uint8_t*>(
-      heap_caps_malloc(kRelayBufferSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-  if (buffer == nullptr) {
-    buffer = static_cast<uint8_t*>(heap_caps_malloc(kRelayBufferSize, MALLOC_CAP_8BIT));
+// Runs one client from key exchange to teardown on its own task.
+void sessionTask(void* argument) {
+  SshSessionContext* ctx = static_cast<SshSessionContext*>(argument);
+  currentSession = ctx;
+  ssh_session session = ctx->session;
+
+  hardenSessionTransport(session);
+  if (ssh_handle_key_exchange(session) != SSH_OK) {
+    eventLogf("SSH: key exchange with %s failed: %s", ctx->peer, ssh_get_error(session));
+  } else if (!authenticateSession(session)) {
+    authFailures.fetch_add(1);
+    eventLogf("SSH: authentication failed from %s (%lu total)", ctx->peer,
+              static_cast<unsigned long>(authFailures.load()));
+  } else {
+    ctx->authenticated = true;
+    sessionsServed.fetch_add(1);
+    eventLogf("SSH: %s authenticated (%s %s), %u/%u sessions active", ctx->peer,
+              ssh_get_cipher_in(session) != nullptr ? ssh_get_cipher_in(session) : "?",
+              ssh_get_kex_algo(session) != nullptr ? ssh_get_kex_algo(session) : "?",
+              activeSessionCount(), kMaxSessions);
+
+    // Over capacity: this authenticated newcomer displaces the oldest
+    // authenticated session. Selection happens under the pool mutex so two
+    // simultaneous newcomers cannot pick the same victim twice or each other.
+    xSemaphoreTake(sessionsMutex, portMAX_DELAY);
+    if (activeSessionCount() > kMaxSessions) {
+      SshSessionContext* oldest = nullptr;
+      for (SshSessionContext& candidate : sessions) {
+        if (&candidate == ctx || !candidate.inUse.load() || !candidate.authenticated.load() ||
+            candidate.evict.load()) {
+          continue;
+        }
+        if (oldest == nullptr ||
+            static_cast<int32_t>(candidate.startedMs - oldest->startedMs) < 0) {
+          oldest = &candidate;
+        }
+      }
+      if (oldest != nullptr) {
+        snprintf(oldest->evictedBy, sizeof(oldest->evictedBy), "%s", ctx->peer);
+        oldest->evict = true;
+        eventLogf("SSH: evicting oldest session (%s, %lu s old) for %s", oldest->peer,
+                  static_cast<unsigned long>((millis() - oldest->startedMs) / 1000UL),
+                  ctx->peer);
+      }
+    }
+    xSemaphoreGive(sessionsMutex);
+
+    handleAuthenticatedSession(session);
+#ifdef BASTION_STACK_DIAG
+    eventLogf("SSH: session task stack headroom %u B",
+              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+#endif
   }
-  return buffer;
+
+  ssh_disconnect(session);
+  ssh_free(session);
+  free(ctx->bufToPc);
+  free(ctx->bufToClient);
+  ctx->bufToPc = nullptr;
+  ctx->bufToClient = nullptr;
+  ctx->session = nullptr;
+  ctx->authenticated = false;
+  ctx->evict = false;
+  ctx->evictedBy[0] = '\0';
+  ctx->inUse = false;
+  currentSession = nullptr;
+  vTaskDelete(nullptr);
 }
 
+SshSessionContext* acquireSlot() {
+  xSemaphoreTake(sessionsMutex, portMAX_DELAY);
+  SshSessionContext* slot = nullptr;
+  for (SshSessionContext& ctx : sessions) {
+    if (!ctx.inUse.load()) {
+      ctx.inUse = true;
+      slot = &ctx;
+      break;
+    }
+  }
+  xSemaphoreGive(sessionsMutex);
+  return slot;
+}
+
+void describePeer(ssh_session session, char* out, size_t outSize) {
+  snprintf(out, outSize, "unknown");
+  const socket_t fd = ssh_get_fd(session);
+  if (fd == SSH_INVALID_SOCKET) {
+    return;
+  }
+  sockaddr_in address = {};
+  socklen_t length = sizeof(address);
+  if (getpeername(fd, reinterpret_cast<sockaddr*>(&address), &length) == 0) {
+    snprintf(out, outSize, "%s:%u", inet_ntoa(address.sin_addr), ntohs(address.sin_port));
+  }
+}
+
+// Accepts connections and hands each one to a session task.
 void sshServerTask(void*) {
   while (WiFi.status() != WL_CONNECTED) {
     delay(250);
   }
 
   libssh_begin();
-  relayToPc = allocateRelayBuffer();
-  relayToClient = allocateRelayBuffer();
-  if (relayToPc == nullptr || relayToClient == nullptr || !ensureHostKey() ||
-      !importAuthorizedKey()) {
+  sessionsMutex = xSemaphoreCreateMutex();
+  if (sessionsMutex == nullptr || !ensureHostKey() || !importAuthorizedKey()) {
     eventLogf("SSH: initialization failed");
     vTaskDelete(nullptr);
     return;
@@ -1607,9 +1804,9 @@ void sshServerTask(void*) {
     vTaskDelete(nullptr);
     return;
   }
-  eventLogf("SSH: listening on %s:%s as %s (key %s)",
+  eventLogf("SSH: listening on %s:%s as %s (key %s), up to %u sessions",
             WiFi.localIP().toString().c_str(), kBindPort, gDeviceConfig.sshUser,
-            authorizedKeyFingerprint);
+            authorizedKeyFingerprint, kMaxSessions);
   otaNoteServiceUp();
 
   // ssh_bind_accept() failing over and over (rather than just once, which is
@@ -1625,29 +1822,7 @@ void sshServerTask(void*) {
       delay(1000);
       continue;
     }
-    if (ssh_bind_accept(bind, session) == SSH_OK) {
-      consecutiveAcceptFailures = 0;
-      describePeer(session);
-      hardenSessionTransport(session);
-      if (ssh_handle_key_exchange(session) != SSH_OK) {
-        eventLogf("SSH: key exchange with %s failed: %s", peerAddress,
-                  ssh_get_error(session));
-      } else if (!authenticateSession(session)) {
-        authFailures.fetch_add(1);
-        eventLogf("SSH: authentication failed from %s (%lu total)", peerAddress,
-                  static_cast<unsigned long>(authFailures.load()));
-      } else {
-        sessionsServed.fetch_add(1);
-        eventLogf("SSH: %s authenticated (%s %s)", peerAddress,
-                  ssh_get_cipher_in(session) != nullptr ? ssh_get_cipher_in(session) : "?",
-                  ssh_get_kex_algo(session) != nullptr ? ssh_get_kex_algo(session) : "?");
-        handleAuthenticatedSession(session);
-#ifdef BASTION_STACK_DIAG
-        eventLogf("SSH: task stack headroom %u B",
-                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-#endif
-      }
-    } else {
+    if (ssh_bind_accept(bind, session) != SSH_OK) {
       eventLogf("SSH: accept failed: %s", ssh_get_error(bind));
       if (++consecutiveAcceptFailures >= kMaxConsecutiveAcceptFailures) {
         eventLogf("SSH: too many consecutive accept failures, rebuilding listener");
@@ -1665,10 +1840,34 @@ void sshServerTask(void*) {
         }
         consecutiveAcceptFailures = 0;
       }
+      ssh_disconnect(session);
+      ssh_free(session);
+      delay(20);
+      continue;
     }
-    ssh_disconnect(session);
-    ssh_free(session);
-    delay(20);
+    consecutiveAcceptFailures = 0;
+
+    SshSessionContext* ctx = acquireSlot();
+    if (ctx == nullptr) {
+      char peer[48];
+      describePeer(session, peer, sizeof(peer));
+      eventLogf("SSH: refusing %s, all %u session slots busy", peer, kSessionSlots);
+      ssh_disconnect(session);  // Fail fast rather than leave the client waiting.
+      ssh_free(session);
+      continue;
+    }
+    ctx->session = session;
+    ctx->startedMs = millis();
+    ctx->columns = 80;
+    describePeer(session, ctx->peer, sizeof(ctx->peer));
+    if (xTaskCreatePinnedToCore(sessionTask, "ssh-session", kSessionTaskStack, ctx, 2,
+                                nullptr, 0) != pdPASS) {
+      eventLogf("SSH: could not start a session task for %s", ctx->peer);
+      ssh_disconnect(session);
+      ssh_free(session);
+      ctx->session = nullptr;
+      ctx->inUse = false;
+    }
   }
 }
 }  // namespace

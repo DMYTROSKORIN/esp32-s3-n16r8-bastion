@@ -5,7 +5,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.2.0-2ea44f.svg"></a>
+  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.3.0-2ea44f.svg"></a>
   <a href=".github/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/DMYTROSKORIN/esp32-s3-n16r8-bastion/build.yml?branch=main&label=build"></a>
   <img alt="Platform" src="https://img.shields.io/badge/board-ESP32--S3--N16R8%20only-e07020.svg">
   <img alt="Framework" src="https://img.shields.io/badge/framework-Arduino%20%2F%20PlatformIO-00979d.svg">
@@ -17,7 +17,7 @@
 > [!IMPORTANT]
 > This board is a deliberately narrow emergency door, not a general-purpose router. It permits
 > `direct-tcpip` forwarding only to the one provisioned PC address and port, accepts SSH from a
-> single authorized public key, and serves one console session at a time. The setup AP
+> single authorized public key, and serves at most three sessions at once. The setup AP
 > (`ESP32_SetUp`) is open/unauthenticated by design — see
 > [Provisioning](#provisioning-wi-fi-pc-ssh-key-wireguard) for the reasoning and the trade-off.
 > Review [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md)
@@ -30,7 +30,7 @@ one thing that can quietly stop working while you're away, with nothing left to 
 
 This project turns a $10 ESP32-S3 dev board into an independent, always-on side door: it joins your
 Wi-Fi on its own, holds up to two WireGuard profiles with automatic active/passive failover, and
-exposes a hardened single-session SSH console. From there you can check on the PC, jump straight
+exposes a hardened SSH console. From there you can check on the PC, jump straight
 into it over a `direct-tcpip` bastion channel, or send it a Wake-on-WLAN Magic Packet if it's asleep.
 Nothing about the board depends on the PC's own tunnel being healthy — that's the point.
 
@@ -61,7 +61,7 @@ before attempting a port.
 The SSH console opens straight into a live status dashboard — no separate monitoring needed:
 
 ```text
-  ESP32 Recovery Gateway   v1.2.0   ESP32-S3-N16R8  • reset: power-on
+  ESP32 Recovery Gateway   v1.3.0   ESP32-S3-N16R8  • reset: power-on
   ──────────────────────────────────────────────────────────────────────────────
   Device     ● ONLINE     up 0d 00:07:44
   Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
@@ -70,7 +70,7 @@ The SSH console opens straight into a live status dashboard — no separate moni
   Main PC    ● ONLINE     192.168.1.200:22  ssh open
   WoWLAN     ● STANDBY    aa:bb:cc:dd:ee:ff
   Memory     ● OK         heap 121 KB (min 114)  psram 8117/8192 KB
-  Firmware   ● CONFIRMED  slot app0  sessions 3
+  Firmware   ● CONFIRMED  slot app0  sessions 1/3 active, 3 total
   ──────────────────────────────────────────────────────────────────────────────
   help commands   pc ssh reach the PC   pc wake wake it up   ota update
 ```
@@ -129,7 +129,8 @@ ssh -J user@203.0.113.10:8326,user@10.66.0.2 user@192.168.1.200
 ```
 
 The ESP32 stores a unique SSH host key in SPIFFS, generated on first boot and wiped only by a
-factory reset. The single-session SSH server is hardened against stalled or vanished clients
+factory reset. The SSH server runs up to three sessions at once (a fourth login displaces the
+oldest, so a hung client can never lock you out), is hardened against stalled or vanished clients
 (key-exchange/auth timeouts, TCP keepalive, idle timeouts), and the bastion relay handles partial
 writes and correctly propagates client-side EOF while draining the PC's remaining response, so full
 interactive sessions — including TUI apps like `btop` — work through the jump chain.
@@ -259,7 +260,7 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 | | |
 |---|---|
 | Board | **ESP32-S3-N16R8** (16 MB QIO flash, 8 MB OPI PSRAM), DevKitC-1 class — the only supported variant |
-| Firmware | v1.2.0 — see [CHANGELOG.md](CHANGELOG.md); signed OTA images on every [release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) |
+| Firmware | v1.3.0 — see [CHANGELOG.md](CHANGELOG.md); signed OTA images on every [release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) |
 | Framework | Arduino core 3.3.11 / ESP-IDF 5.5.5 via [pioarduino](https://github.com/pioarduino/platform-espressif32) 55.03.311, IDF rebuilt with `custom_sdkconfig`, `-O2`; legacy env on `espressif32 @ 7.0.1` (Arduino 2.0.17) |
 | CI | [GitHub Actions](.github/workflows/build.yml) builds both environments on every push, signs the OTA image and publishes the release assets on `v*` tags |
 | SSH server | [LibSSH-ESP32](https://github.com/ewpa/LibSSH-ESP32) (Arduino port of libssh) |

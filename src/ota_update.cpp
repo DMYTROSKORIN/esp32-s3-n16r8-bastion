@@ -36,6 +36,10 @@ constexpr size_t kMinImageBytes = 64 * 1024;  // Anything smaller is not an app.
 
 std::atomic<bool> serviceUp{false};
 std::atomic<bool> selfTestPending{false};
+// Exactly one image may be in flight; a second SSH session asking for an
+// update while one is streaming gets a clear refusal instead of two writers
+// on the same slot.
+std::atomic<bool> otaInProgress{false};
 
 // The journal dies with every reboot, and an OTA outcome is exactly the kind
 // of event that is followed by a reboot. Keep the last one in NVS so
@@ -108,6 +112,7 @@ extern "C" bool verifyRollbackLater() { return true; }
 // ---------------------------------------------------------------------------
 
 struct OtaSink::Impl {
+  bool owner = false;  // Holds the otaInProgress token.
   const esp_partition_t* target = nullptr;
   esp_ota_handle_t handle = 0;
   bool active = false;
@@ -149,11 +154,20 @@ OtaSink::OtaSink() : impl_(new Impl()) {}
 
 OtaSink::~OtaSink() {
   abort();
+  if (impl_->owner) {
+    otaInProgress = false;
+  }
   delete impl_;
 }
 
 bool OtaSink::begin(OtaResult& result) {
   result = OtaResult{};
+  bool expected = false;
+  if (!otaInProgress.compare_exchange_strong(expected, true)) {
+    setResult(result, false, "another firmware update is already in progress");
+    return false;
+  }
+  impl_->owner = true;
   const esp_partition_t* running = esp_ota_get_running_partition();
   impl_->target = esp_ota_get_next_update_partition(nullptr);
   if (impl_->target == nullptr || running == nullptr ||

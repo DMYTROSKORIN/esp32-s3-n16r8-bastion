@@ -381,8 +381,11 @@ void setup() {
   // allocations fragment the tiny internal heap until one fails outright
   // with ENOMEM, killing the relay - confirmed live via
   // "ssh_socket_write: Out of memory" while htop (much lighter output)
-  // never triggers it.
-  heap_caps_malloc_extmem_enable(512);
+  // never triggers it. 256 B (was 512) since three concurrent sessions plus
+  // a TLS handshake for `ota https://` measurably compete for internal RAM;
+  // anything that needs DMA-capable or internal memory asks for it through
+  // heap_caps_malloc() explicitly and is unaffected by this threshold.
+  heap_caps_malloc_extmem_enable(256);
 
   pinMode(kBootButtonPin, INPUT_PULLUP);
   // A LOW level already present at boot is deliberately *not* treated as a

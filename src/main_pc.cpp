@@ -258,13 +258,21 @@ bool mainPcPing(uint8_t count, PingStats& stats) {
   if (gDeviceConfig.pcIp[0] == '\0' || WiFi.status() != WL_CONNECTED || count == 0) {
     return false;
   }
-  // One ping burst at a time: the SSH console is single-session, so a static
-  // context is enough and avoids a heap allocation per command.
+  // One ping burst at a time: sessions run concurrently, so the shared
+  // context is guarded and a second caller is told "busy" instead of racing.
   static PingContext context;
   static SemaphoreHandle_t done = xSemaphoreCreateBinary();
-  if (done == nullptr) {
+  static SemaphoreHandle_t busy = xSemaphoreCreateMutex();
+  if (done == nullptr || busy == nullptr) {
     return false;
   }
+  if (xSemaphoreTake(busy, 0) != pdTRUE) {
+    return false;  // Another session's ping is still running.
+  }
+  struct BusyRelease {
+    SemaphoreHandle_t handle;
+    ~BusyRelease() { xSemaphoreGive(handle); }
+  } release{busy};
   while (xSemaphoreTake(done, 0) == pdTRUE) {
   }
   context = PingContext{};

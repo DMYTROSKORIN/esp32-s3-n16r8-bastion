@@ -32,9 +32,9 @@ memory or flash layout assumes exactly that part:
 | Resource | How it is used |
 |---|---|
 | 16 MB flash, QIO @ 80 MHz | `default_16MB.csv`: two 6.25 MB OTA app slots (`app0`/`app1`), 3.4 MB SPIFFS (SSH host key), 64 KB coredump, NVS at 0x9000 (provisioned settings, learned MAC, boot counter). The stock `default_8MB.csv` of the DevKitC-1 board definition would waste half the chip. |
-| 8 MB PSRAM, OPI @ 80 MHz | `board_build.arduino.memory_type = qio_opi`; `heap_caps_malloc_extmem_enable(512)` sends every allocation of 512 B or more to PSRAM, which is what keeps libssh's per-packet buffers from fragmenting the ~320 KB of internal RAM under sustained traffic. The event journal (28 KB) lives there too. Internal RAM is reserved for what must be fast: task stacks, lwIP/Wi-Fi buffers, the two 8 KB relay buffers. |
+| 8 MB PSRAM, OPI @ 80 MHz | `board_build.arduino.memory_type = qio_opi`; `heap_caps_malloc_extmem_enable(512)` sends every allocation of 512 B or more to PSRAM, which is what keeps libssh's per-packet buffers from fragmenting the ~320 KB of internal RAM under sustained traffic. The event journal (40 KB) lives there too. Internal RAM is reserved for what must be fast: task stacks, lwIP/Wi-Fi buffers, the two 8 KB relay buffers. |
 | CPU 240 MHz, dual core | Core 0: Wi-Fi driver, lwIP `tcpip_thread`, SSH server task. Core 1: Arduino loop (LED, button, watchdog feed), `net-monitor`, `recovery-vpn`. |
-| Custom-built core | Arduino 3.3.11 / ESP-IDF 5.5.5 (pioarduino 55.03.311) with the IDF libraries rebuilt from source: lwIP TCP window and send buffer 32 KB, receive mailbox 32, SACK, `tcpip_thread` stack 6 KB, 16/64 static/dynamic Wi-Fi RX buffers, 16 static TX, BA window 32, dynamic Wi-Fi/lwIP pools in PSRAM, Wi-Fi/lwIP hot paths in IRAM, `-O2`. See `custom_sdkconfig` in `platformio.ini`; the legacy environment documents what the stock core gives instead. |
+| Custom-built core | Arduino 3.3.11 / ESP-IDF 5.5.5 (pioarduino 55.03.311) with the IDF libraries rebuilt from source: lwIP TCP window and send buffer 32 KB, receive mailbox 32, SACK, `tcpip_thread` stack 6 KB, 12/64 static/dynamic Wi-Fi RX buffers, 16 static TX, BA window 24, dynamic Wi-Fi/lwIP pools in PSRAM, Wi-Fi/lwIP hot paths in IRAM, `-O2`. See `custom_sdkconfig` in `platformio.ini`; the legacy environment documents what the stock core gives instead. |
 | Hardware AES / SHA / MPI | mbedTLS uses the S3's accelerators for AES (all SSH ciphers offered), SHA-256/512 (MACs, KEX hashes) and big-number math (ECDH). chacha20-poly1305 is not part of this libssh/mbedTLS build (the Arduino core omits mbedTLS's CHACHAPOLY module) and is not offered - see "SSH throughput" below. |
 
 The boot banner prints what it actually found (`flash 16 MB QIO @ 80 MHz |
@@ -196,13 +196,47 @@ heap by its low-water mark since boot. `Firmware` shows the running OTA slot
 and whether a freshly installed image is still in its self-test. The exact
 line semantics are in [cli-reference.md](cli-reference.md).
 
+### Session pool
+
+Since 1.3.0 the server runs up to **three** sessions concurrently, each on
+its own FreeRTOS task with its own libssh session (`kMaxSessions` in
+`src/recovery_ssh.cpp`); before that it was strictly one at a time, and a
+single hung client - or the owner's own forgotten terminal - left every
+other connection waiting for an SSH banner that never came.
+
+Eviction rule: a fourth connection is accepted into an overflow slot and
+allowed to complete key exchange and authentication. Only if it presents
+the authorized key does it displace the **oldest authenticated** session,
+which is told `Session closed: replaced by a newer login from <address>`
+at its next poll (console prompt, `watch`, relay loop or OTA upload all
+check within a second). An unauthenticated fourth connection displaces
+nobody, so bare TCP connections from a scanner cannot knock the owner out.
+A fifth simultaneous connection is refused at accept time.
+
+Concurrency requires mbedTLS's internal locking: libssh shares one
+CTR-DRBG between sessions (every packet's padding draws from it) and the
+hardware AES/SHA drivers share contexts. The default build therefore sets
+`CONFIG_MBEDTLS_THREADING_C` / `CONFIG_MBEDTLS_THREADING_PTHREAD` in
+`custom_sdkconfig`; the legacy prebuilt core has no such option and keeps
+`kMaxSessions = 1`. Shared firmware state touched from sessions is either
+atomic, per-session (`thread_local` context, per-session relay buffers in
+PSRAM, per-session command history) or serialised (`pc ping`, and only one
+OTA image in flight at a time).
+
+Memory: 12 KB of internal RAM per session task (peak measured use 5.4 KB
+with an RSA client key, including a relay and an HTTPS OTA attempt), relay
+buffers in PSRAM, and every plain allocation of 256 B or more in PSRAM.
+Measured on the bench: 132 KB of internal heap free idle, 96 KB with three
+sessions open, 72 KB at the lowest point (a fourth login's key exchange
+while three sessions were active).
+
 ### SSH server robustness
 
-The server handles one session at a time, so every blocking operation is
-bounded — otherwise a single abandoned client (stuck on a host-key prompt, a
-phone that dropped off the network, a port scanner) would permanently block
-the emergency console until the board was power-cycled. That exact failure
-was found and fixed on 2026-08-25.
+Every blocking operation per session is bounded — otherwise an abandoned
+client (stuck on a host-key prompt, a phone that dropped off the network, a
+port scanner) would hold its slot until the board was power-cycled. That
+exact failure was found and fixed on 2026-08-25, when the server was still
+single-session.
 
 Implemented limits (`src/recovery_ssh.cpp`):
 
@@ -411,9 +445,10 @@ exactly as after a USB flash; that state passes the self-test.
 - No downgrade protection: any correctly signed image installs, including
   an older one - by design, so that a bad release can be undone by
   installing the previous release the same way (or `ota rollback yes`).
-- The console is single-session; while an image is being received (10-20 s
-  on the LAN, up to a minute or two through WireGuard for 1.7 MB) nothing
-  else can log in.
+- Only one image can be in flight at a time; a second `ota` from another
+  session is refused with "another firmware update is already in progress".
+  Other sessions keep working while an image is being received (10-20 s on
+  the LAN, up to a minute or two through WireGuard for 1.7 MB).
 - The bootloader itself and the partition table are not updated over the
   air. Both are stable; changing either still requires USB.
 
@@ -820,10 +855,13 @@ Lessons from debugging on 2026-08-25/26 — check in this order:
    (`vpn status` in the console over LAN, or `wg show` on the server: the
    board's peer should have a recent handshake). Remember that the board's
    tunnel IP differs between servers.
-2. **TCP:22 opens, but the SSH banner never arrives.** Before the fix this
-   meant the single-threaded server had wedged (fixable only by rebooting
-   the board); after the fix the server reclaims dead sessions on its own
-   within 30-60 s. If it recurs, capture the serial log.
+2. **TCP:22 opens, but the SSH banner never arrives.** Up to 1.2.0 this
+   meant the single session was taken - by a wedged client, or simply by
+   your own other terminal (a hung `ssh -J` on a laptop was enough to make
+   every other attempt time out at "banner exchange"). Since 1.3.0 three
+   sessions run at once and a fourth login displaces the oldest, so this
+   should only be seen with five or more simultaneous connections. If it
+   recurs, `logs` shows every accept/refusal with the peer address.
 3. **A session gets dropped under load (e.g. `btop`, but not `htop`).** Two
    independent fixes: (a) bytes lost on a partial write in the relay —
    fixed, verify with a checksum:

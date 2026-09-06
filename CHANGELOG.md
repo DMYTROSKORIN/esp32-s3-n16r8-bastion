@@ -4,6 +4,60 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-09-06
+
+### Added
+
+- **Concurrent SSH sessions.** Up to three sessions run at the same time,
+  each on its own task; a fourth client is admitted as far as authentication
+  and, once it has proven it holds the authorized key, displaces the oldest
+  authenticated session (`Session closed: replaced by a newer login from
+  <address>`). An unauthenticated newcomer displaces nobody; a fifth
+  simultaneous connection is refused immediately. A hung or forgotten
+  terminal can therefore no longer lock the owner out, which is what the
+  previous single-session design did (every further attempt timed out at
+  "banner exchange").
+- Dashboard `Firmware` row shows `sessions N/3 active, M total`.
+
+### Changed
+
+- `CONFIG_MBEDTLS_THREADING_C` / `CONFIG_MBEDTLS_THREADING_PTHREAD` enabled
+  in `custom_sdkconfig`: libssh shares one CTR-DRBG between sessions and the
+  hardware crypto drivers share contexts, so concurrency needs mbedTLS's own
+  locking. The legacy prebuilt-core build has no such option and stays
+  single-session.
+- Relay/OTA buffers are per session and live in PSRAM; command history is
+  per session; `pc ping` and OTA are serialised across sessions.
+- Internal-RAM budget for the pool: session task stacks 12 KB each (measured
+  peak 5.4 KB), plain allocations of 256 B and up go to PSRAM (was 512 B),
+  static Wi-Fi RX buffers 16 → 12 (BA window 24). The acceptor task keeps a
+  16 KB stack: `ssh_bind_accept()` re-imports the host key per connection
+  and overflowed a 6 KB stack during development, corrupting kernel lists.
+- Journal lines grow from 112 to 160 characters (the `SSH: listening ...`
+  line was being truncated).
+
+### Tested on the bench
+
+- Three consoles open, a fourth login: the oldest console received
+  `Session closed: replaced by a newer login from ...` and exited, the other
+  two kept working; the journal shows `evicting oldest session (..., 12 s
+  old)`.
+- Pool full, a login with a key that is not authorized: `Permission denied`,
+  no session evicted.
+- Four connections in flight (three consoles plus an authentication attempt),
+  a fifth: refused at accept (`refusing ..., all 4 session slots busy`), the
+  client sees the connection close immediately instead of a hanging banner.
+- Relay through the pool (`ssh -J board pc`, 1 MB) alongside open consoles:
+  works.
+- Free internal heap: 132 KB idle (up from 121 KB in 1.2.0 thanks to the
+  256 B PSRAM threshold), 96 KB with three sessions open, 72 KB minimum during
+  the fourth login's key exchange. Session task stack peak 5.4 KB of 12 KB;
+  `tcpip_thread` headroom 4.3 KB of 6 KB.
+- Installed onto the board over the air from 1.2.0 (twice, both slots),
+  self-test passed after 2 s each time. An earlier development build with a
+  6 KB acceptor stack crashed on first boot and was rolled back automatically -
+  the first real-world exercise of the rollback path.
+
 ## [1.2.0] - 2026-09-06
 
 ### Added
@@ -77,9 +131,10 @@ All notable changes to this project are documented here. The format follows
 - **lwIP TCP window 5760 → 32768 bytes** (`CONFIG_LWIP_TCP_WND_DEFAULT`,
   `CONFIG_LWIP_TCP_SND_BUF_DEFAULT`), receive mailbox 6 → 32 segments, SACK
   on, `tcpip_thread` stack 2560 → 6144 bytes, Wi-Fi driver buffers sized to
-  match (16 static / 64 dynamic RX, 16 static TX, BA window 32; the dynamic
+  match (16 static / 64 dynamic RX, 16 static TX, BA window 32 (24 since 1.3.0); the dynamic
   Wi-Fi/lwIP pools in PSRAM), Wi-Fi and lwIP hot paths in IRAM, IDF libraries
-  at `-O2`. This removes the throughput ceiling documented in 1.0.0.
+  at `-O2`. This removes the throughput ceiling documented in 1.0.0. (1.3.0
+  trims the static RX buffers to 12 to make room for concurrent sessions.)
 - Watchdog set-up uses the ESP-IDF 5 API (`esp_task_wdt_reconfigure`) when
   built on IDF 5; the IDF 4 path is kept for the legacy environment.
 - `esp32-s3-n16r8-legacy` environment keeps the 1.0.0 build (official

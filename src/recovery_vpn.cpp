@@ -418,7 +418,8 @@ bool recoveryVpnOnline() { return vpnState == VpnState::kOnline; }
 const char* recoveryVpnStateName() { return stateName(vpnState); }
 
 const char* recoveryVpnActiveProfileName() {
-  static char name[16];
+  // thread_local: several SSH sessions may render dashboards concurrently.
+  static thread_local char name[16];
   const int8_t index = activeProfile;
   if (index < 0 || index >= profileCount()) {
     return "none";

@@ -10,8 +10,8 @@
 #include <string.h>
 
 namespace {
-constexpr size_t kLineSize = 112;
-constexpr size_t kCapacity = 256;  // 256 x 112 B = 28 KB, lives in PSRAM.
+constexpr size_t kLineSize = 160;
+constexpr size_t kCapacity = 256;  // 256 x 160 B = 40 KB, lives in PSRAM.
 
 char (*lines)[kLineSize] = nullptr;
 size_t head = 0;   // Next slot to write.
