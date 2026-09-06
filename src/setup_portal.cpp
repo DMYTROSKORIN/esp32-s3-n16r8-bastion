@@ -13,6 +13,7 @@
 #include "device_config.h"
 #include "event_log.h"
 #include "firmware_info.h"
+#include "ota_update.h"
 #include "portal_html.h"
 #include "wg_conf.h"
 
@@ -123,7 +124,7 @@ void handleConfig() {
            "\"sshKeySet\":%s,\"sshKeyType\":\"%s\","
            "\"wg1Set\":%s,\"wg1Endpoint\":\"%s\",\"wg1SshPort\":%u,"
            "\"wg2Set\":%s,\"wg2Endpoint\":\"%s\",\"wg2SshPort\":%u,"
-           "\"fw\":\"%s\",\"board\":\"%s\"}",
+           "\"fw\":\"%s\",\"board\":\"%s\",\"otaAuto\":%s}",
            deviceConfigPresent() ? "true" : "false", ssid,
            gDeviceConfig.wifiPassword[0] != '\0' ? "true" : "false",
            gDeviceConfig.pcIp, gDeviceConfig.pcPort, gDeviceConfig.sshUser,
@@ -133,7 +134,7 @@ void handleConfig() {
            gDeviceConfig.wg[0].vpnServerSshPort,
            gDeviceConfig.wgProfileCount >= 2 ? "true" : "false", wg2,
            gDeviceConfig.wg[1].vpnServerSshPort, FIRMWARE_VERSION,
-           FIRMWARE_TARGET_BOARD);
+           FIRMWARE_TARGET_BOARD, otaAutoUpdateEnabled() ? "true" : "false");
   httpServer.send(200, "application/json", json);
 }
 
@@ -502,6 +503,11 @@ void handleApply() {
   draft.wgProfileCount =
       draft.wg[0].endpoint[0] != '\0' ? (draft.wg[1].endpoint[0] != '\0' ? 2 : 1)
                                       : 0;
+  // Not part of DeviceConfig on purpose: its own NVS key keeps the blob's
+  // layout (and therefore existing provisioning) unchanged.
+  if (httpServer.hasArg("ota_auto")) {
+    otaSetAutoUpdate(httpServer.arg("ota_auto") == "1");
+  }
   gDeviceConfig = draft;
   if (!deviceConfigSave()) {
     httpServer.send(500, "application/json",

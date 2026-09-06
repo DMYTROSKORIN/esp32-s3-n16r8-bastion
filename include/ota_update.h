@@ -79,3 +79,32 @@ bool otaSelfTestPending();
 // connections, or the setup portal is up (a firmware whose config layout
 // changed legitimately lands there). One of the self-test criteria.
 void otaNoteServiceUp();
+
+// ---------------------------------------------------------------------------
+// Release check (GitHub Releases of OTA_GITHUB_REPO)
+//
+// Once a day the board asks GitHub for the latest release, compares its tag
+// with FIRMWARE_VERSION and remembers the result for the dashboard and
+// `ota status`. With automatic updates enabled (setup portal, `ota auto on`)
+// a newer release is installed as soon as no SSH session is active;
+// otherwise the board only reports it and the owner runs `ota upgrade`.
+// ---------------------------------------------------------------------------
+
+struct OtaUpdateInfo {
+  bool checked;              // At least one check has completed since boot.
+  bool newer;                // latestVersion > FIRMWARE_VERSION.
+  char latestVersion[32];    // Tag without the leading 'v'.
+  char url[256];             // firmware-signed.bin of the latest release.
+  char error[96];            // Why the last check failed, if it did.
+  uint32_t checkedAtMs;      // millis() of the last completed check.
+};
+
+// Queries GitHub now (blocking, a few seconds). Updates the shared result.
+bool otaCheckForUpdate(OtaUpdateInfo& out);
+// Copy of the last result.
+void otaGetUpdateInfo(OtaUpdateInfo& out);
+// Automatic-update preference, persisted in NVS (default: off).
+bool otaAutoUpdateEnabled();
+void otaSetAutoUpdate(bool enabled);
+// Starts the daily checker task (first check ~2 minutes after boot).
+void otaUpdateCheckerStart();

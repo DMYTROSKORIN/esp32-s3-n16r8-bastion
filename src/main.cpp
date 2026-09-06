@@ -3,7 +3,6 @@
 #include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
-#include <esp_idf_version.h>
 #include <esp_task_wdt.h>
 #include <esp_wifi.h>
 #include <math.h>
@@ -204,6 +203,7 @@ void renderStatusLed() {
 // restarts into the (now unprovisioned) setup portal. Never returns.
 void doFactoryReset() {
   eventLogf("BOOT held 10s: factory reset.");
+  eventLogPersist("factory reset");
   const uint32_t flashStartMs = millis();
   while (millis() - flashStartMs < kFactoryResetFlashMs) {
     setLed((millis() % 200U) < 100U ? 60 : 0, 0, 0);
@@ -228,6 +228,7 @@ void handleBootButton() {
 
   if (releasePending && releaseMs - pressStartMs >= kEditModeHoldMs) {
     eventLogf("BOOT held 5s: reopening setup portal.");
+    eventLogPersist("portal reopen");
     portalRequestFlagSet();
     delay(200);
     ESP.restart();
@@ -404,10 +405,9 @@ void setup() {
   const uint32_t bootCount = deviceConfigBumpBootCount();
   logBootBanner(bootCount);
 
-  // Watchdog on the loop task; the net-monitor task subscribes itself.
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-  // ESP-IDF 5: the core already started the TWDT (idle tasks); reconfigure
-  // its timeout instead of re-initialising it.
+  // Watchdog on the loop task; the net-monitor task subscribes itself. The
+  // core already started the TWDT for the idle tasks; reconfigure its timeout
+  // instead of re-initialising it.
   esp_task_wdt_config_t watchdogConfig = {};
   watchdogConfig.timeout_ms = kWatchdogTimeoutSeconds * 1000UL;
   watchdogConfig.idle_core_mask = (1 << 0);
@@ -415,9 +415,6 @@ void setup() {
   if (esp_task_wdt_reconfigure(&watchdogConfig) != ESP_OK) {
     esp_task_wdt_init(&watchdogConfig);
   }
-#else
-  esp_task_wdt_init(kWatchdogTimeoutSeconds, true);
-#endif
   esp_task_wdt_add(nullptr);
 
   // If this is the first boot of a freshly installed OTA image, start the
@@ -462,6 +459,7 @@ void setup() {
   netMonitorStart();
   startRecoverySshServer();
   startRecoveryVpn();
+  otaUpdateCheckerStart();
 }
 
 void loop() {

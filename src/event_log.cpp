@@ -1,6 +1,7 @@
 #include "event_log.h"
 
 #include <Arduino.h>
+#include <SPIFFS.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -13,9 +14,15 @@ namespace {
 constexpr size_t kLineSize = 160;
 constexpr size_t kCapacity = 256;  // 256 x 160 B = 40 KB, lives in PSRAM.
 
+constexpr char kPreviousPath[] = "/journal.prev";
+constexpr size_t kPersistLines = 120;
+constexpr uint32_t kPersistIntervalMs = 10 * 60 * 1000;
+
 char (*lines)[kLineSize] = nullptr;
 size_t head = 0;   // Next slot to write.
 size_t count = 0;  // Retained entries.
+uint32_t sequence = 0;  // Lines written since boot.
+uint32_t lastPersistMs = 0;
 SemaphoreHandle_t mutex = nullptr;
 
 void stampUptime(char* out, size_t outSize) {
@@ -66,7 +73,111 @@ void eventLogf(const char* format, ...) {
   if (count < kCapacity) {
     ++count;
   }
+  ++sequence;
   xSemaphoreGive(mutex);
+}
+
+uint32_t eventLogSequence() {
+  if (mutex == nullptr) {
+    return 0;
+  }
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  const uint32_t current = sequence;
+  xSemaphoreGive(mutex);
+  return current;
+}
+
+uint32_t eventLogForEachSince(uint32_t fromSequence,
+                              void (*emit)(const char* line, void* userData),
+                              void* userData) {
+  if (lines == nullptr || mutex == nullptr) {
+    return fromSequence;
+  }
+  for (;;) {
+    char line[kLineSize];
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    const uint32_t oldest = sequence - static_cast<uint32_t>(count);
+    if (fromSequence < oldest) {
+      fromSequence = oldest;  // Already evicted from the ring.
+    }
+    if (fromSequence >= sequence) {
+      xSemaphoreGive(mutex);
+      return fromSequence;
+    }
+    const size_t slot = (head + kCapacity - count + (fromSequence - oldest)) % kCapacity;
+    memcpy(line, lines[slot], kLineSize);
+    xSemaphoreGive(mutex);
+    line[kLineSize - 1] = '\0';
+    emit(line, userData);
+    ++fromSequence;
+  }
+}
+
+namespace {
+struct PersistState {
+  File file;
+  size_t written;
+};
+
+void persistLine(const char* line, void* userData) {
+  PersistState* state = static_cast<PersistState*>(userData);
+  state->file.println(line);
+  ++state->written;
+}
+}  // namespace
+
+bool eventLogPersist(const char* reason) {
+  if (!SPIFFS.begin(true)) {
+    return false;
+  }
+  // Write to a temporary name first so a reset in the middle of the write
+  // leaves the previous snapshot intact rather than a truncated one.
+  File file = SPIFFS.open("/journal.tmp", FILE_WRITE);
+  if (!file) {
+    return false;
+  }
+  char stamp[20];
+  stampUptime(stamp, sizeof(stamp));
+  file.printf("# journal saved: %s, uptime %s s, %lu lines written this boot\n", reason,
+              stamp, static_cast<unsigned long>(eventLogSequence()));
+  const size_t total = eventLogCount();
+  const uint32_t from = eventLogSequence() - static_cast<uint32_t>(
+                                                 total > kPersistLines ? kPersistLines : total);
+  PersistState state{file, 0};
+  eventLogForEachSince(from, persistLine, &state);
+  state.file.close();
+  SPIFFS.remove(kPreviousPath);
+  const bool ok = SPIFFS.rename("/journal.tmp", kPreviousPath);
+  lastPersistMs = millis();
+  return ok;
+}
+
+void eventLogPersistPeriodically() {
+  if (millis() - lastPersistMs >= kPersistIntervalMs) {
+    eventLogPersist("periodic snapshot");
+  }
+}
+
+bool eventLogPreviousForEach(void (*emit)(const char* line, void* userData),
+                             void* userData) {
+  if (!SPIFFS.begin(true) || !SPIFFS.exists(kPreviousPath)) {
+    return false;
+  }
+  File file = SPIFFS.open(kPreviousPath, FILE_READ);
+  if (!file) {
+    return false;
+  }
+  char line[kLineSize];
+  while (file.available()) {
+    const size_t length = file.readBytesUntil('\n', line, sizeof(line) - 1);
+    line[length] = '\0';
+    if (length > 0 && line[length - 1] == '\r') {
+      line[length - 1] = '\0';
+    }
+    emit(line, userData);
+  }
+  file.close();
+  return true;
 }
 
 size_t eventLogCount() {

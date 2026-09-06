@@ -4,6 +4,48 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-09-06
+
+### Added
+
+- **Daily release check.** Two minutes after boot and then once a day the
+  board asks GitHub Releases (`OTA_GITHUB_REPO`, set in `platformio.ini`) for
+  the latest tag and compares it with its own version. A newer release shows
+  up in the dashboard as `Firmware ● UPDATE v1.5.0 available: ota upgrade`
+  and in `ota status`; `ota check` runs the check on demand.
+- **`ota upgrade`** installs the latest release found by the check (download,
+  signature verification, self-test and rollback exactly as for `ota <url>`).
+- **Automatic updates, opt-in.** The setup portal has a new *Firmware
+  updates* section with an "Install updates automatically" checkbox (default
+  off); `ota auto on|off` changes it later from the console. When on, a newer
+  release is installed as soon as no SSH session is active, so an update never
+  interrupts a console or a bastion relay. The preference lives in its own NVS
+  key, so existing provisioning is untouched.
+- **`logs follow`** streams new journal lines until a key is pressed.
+- **`logs previous`** shows the journal saved to SPIFFS before the last
+  reboot. The last 120 lines are written before every planned restart (reboot
+  command, OTA, rollback, Wi-Fi-loss restart, factory reset, portal reopen)
+  and every 10 minutes by the network monitor, so a panic or watchdog reset
+  loses at most 10 minutes of history.
+
+### Removed
+
+- The `esp32-s3-n16r8-legacy` environment (official PlatformIO platform,
+  prebuilt Arduino 2.0.17 / ESP-IDF 4.4 core) and every `#if` that kept the
+  code compiling on it. It was single-session, had no HTTPS OTA, kept the
+  5760-byte TCP window, and cost a second CI build plus compatibility patches
+  for every change. The 1.0.0 tag remains as the historical reference for the
+  prebuilt-core configuration.
+- The `BASTION_BENCH_ALL_CIPHERS` build switch: the libssh build has no
+  chacha20 to compare against, so the switch changed nothing.
+
+### Documentation
+
+- The decision **not** to enable Secure Boot V2 and Flash Encryption is now
+  stated prominently in the README and the architecture document, with the
+  concrete risk it leaves open (unsigned USB flashing; secrets readable from a
+  board in hand) and the conditions under which it should be revisited.
+
 ## [1.3.0] - 2026-09-06
 
 ### Added

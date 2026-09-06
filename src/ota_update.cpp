@@ -4,17 +4,9 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <atomic>
-#include <esp_idf_version.h>
-#include <sdkconfig.h>
-// HTTPS download needs the CA bundle API of ESP-IDF 5 (default build); the
-// legacy IDF 4.4 environment keeps only the SSH upload path.
-#define BASTION_OTA_HTTPS (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0))
-#if BASTION_OTA_HTTPS
+#include <cJSON.h>
+#include <esp_app_desc.h>
 #include <esp_crt_bundle.h>
-#endif
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-#include <esp_app_desc.h>  // esp_app_desc_t; on IDF 4.4 it comes with esp_ota_ops.h
-#endif
 #include <esp_http_client.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
@@ -25,6 +17,7 @@
 #include "event_log.h"
 #include "firmware_info.h"
 #include "ota_public_key.h"
+#include "recovery_ssh.h"
 
 namespace {
 constexpr uint32_t kSelfTestTimeoutMs = 2 * 60 * 1000;
@@ -342,12 +335,6 @@ bool otaFromUrl(const char* url, OtaReportFn reportFn, void* userData, OtaResult
     return false;
   }
 
-#if !BASTION_OTA_HTTPS
-  setResult(result, false,
-            "HTTPS download is not available on the legacy build; use "
-            "`ssh <user>@<board> ota < firmware-signed.bin`");
-  return false;
-#else
   esp_http_client_config_t config = {};
   config.url = url;
   config.crt_bundle_attach = esp_crt_bundle_attach;
@@ -460,7 +447,6 @@ done:
     eventLogf("OTA: download from URL failed: %s", result.message);
   }
   return ok;
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -593,5 +579,259 @@ void otaSelfTestStart() {
     eventLogf("OTA: could not start self-test task, confirming image immediately");
     esp_ota_mark_app_valid_cancel_rollback();
     selfTestPending = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Release check
+// ---------------------------------------------------------------------------
+
+#ifndef OTA_GITHUB_REPO
+#define OTA_GITHUB_REPO "DMYTROSKORIN/esp32-s3-n16r8-bastion"
+#endif
+
+namespace {
+constexpr char kNvsAutoKey[] = "ota_auto";
+constexpr char kReleaseAsset[] = "firmware-signed.bin";
+constexpr uint32_t kFirstCheckDelayMs = 2 * 60 * 1000;
+constexpr uint32_t kCheckIntervalMs = 24UL * 60UL * 60UL * 1000UL;
+constexpr uint32_t kCheckRetryMs = 60 * 60 * 1000;  // After a failed check.
+constexpr size_t kMaxApiResponse = 24 * 1024;  // The release JSON is a few KB.
+
+OtaUpdateInfo updateInfo = {};
+SemaphoreHandle_t updateInfoMutex = nullptr;
+std::atomic<bool> autoUpdateCached{false};
+std::atomic<bool> autoUpdateLoaded{false};
+
+void ensureUpdateMutex() {
+  if (updateInfoMutex == nullptr) {
+    updateInfoMutex = xSemaphoreCreateMutex();
+  }
+}
+
+// "v1.4.0", "1.4.0+ota1", "1.4.0-rc1" -> {1,4,0}. Returns false on garbage.
+bool parseVersion(const char* text, int out[3]) {
+  if (text == nullptr) {
+    return false;
+  }
+  if (*text == 'v' || *text == 'V') {
+    ++text;
+  }
+  out[0] = out[1] = out[2] = 0;
+  int part = 0;
+  bool digits = false;
+  for (; *text != '\0'; ++text) {
+    if (*text >= '0' && *text <= '9') {
+      out[part] = out[part] * 10 + (*text - '0');
+      digits = true;
+    } else if (*text == '.' && part < 2 && digits) {
+      ++part;
+      digits = false;
+    } else {
+      break;  // Pre-release / build metadata: ignored for ordering.
+    }
+  }
+  return part >= 1 || digits;
+}
+
+bool isNewerVersion(const char* candidate, const char* current) {
+  int a[3], b[3];
+  if (!parseVersion(candidate, a) || !parseVersion(current, b)) {
+    return false;
+  }
+  for (int i = 0; i < 3; ++i) {
+    if (a[i] != b[i]) {
+      return a[i] > b[i];
+    }
+  }
+  return false;
+}
+
+// GET a small HTTPS document into a PSRAM buffer. Returns bytes read, -1 on
+// error (message in `error`).
+int httpsGet(const char* url, char* buffer, size_t capacity, char* error, size_t errorSize) {
+  esp_http_client_config_t config = {};
+  config.url = url;
+  config.crt_bundle_attach = esp_crt_bundle_attach;
+  config.timeout_ms = kHttpTimeoutMs;
+  config.buffer_size = 4096;
+  config.buffer_size_tx = 1024;
+  config.user_agent = "esp32-s3-n16r8-bastion/" FIRMWARE_VERSION;
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client == nullptr) {
+    snprintf(error, errorSize, "http client init failed");
+    return -1;
+  }
+  esp_http_client_set_header(client, "Accept", "application/vnd.github+json");
+  int total = -1;
+  esp_err_t err = esp_http_client_open(client, 0);
+  if (err != ESP_OK) {
+    snprintf(error, errorSize, "connect failed: %s", esp_err_to_name(err));
+    goto done;
+  }
+  esp_http_client_fetch_headers(client);
+  {
+    const int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+      snprintf(error, errorSize, "GitHub answered HTTP %d", status);
+      goto done;
+    }
+  }
+  total = 0;
+  while (static_cast<size_t>(total) < capacity - 1) {
+    const int count = esp_http_client_read(client, buffer + total, capacity - 1 - total);
+    if (count < 0) {
+      snprintf(error, errorSize, "read error");
+      total = -1;
+      goto done;
+    }
+    if (count == 0) {
+      break;
+    }
+    total += count;
+  }
+  buffer[total] = '\0';
+done:
+  esp_http_client_close(client);
+  esp_http_client_cleanup(client);
+  return total;
+}
+}  // namespace
+
+bool otaCheckForUpdate(OtaUpdateInfo& out) {
+  ensureUpdateMutex();
+  OtaUpdateInfo info = {};
+  char* body = static_cast<char*>(malloc(kMaxApiResponse));
+  if (body == nullptr) {
+    snprintf(info.error, sizeof(info.error), "out of memory");
+  } else {
+    const char* url = "https://api.github.com/repos/" OTA_GITHUB_REPO "/releases/latest";
+    const int length = httpsGet(url, body, kMaxApiResponse, info.error, sizeof(info.error));
+    if (length > 0) {
+      cJSON* root = cJSON_ParseWithLength(body, length);
+      if (root == nullptr) {
+        snprintf(info.error, sizeof(info.error), "release JSON did not parse");
+      } else {
+        const cJSON* tag = cJSON_GetObjectItemCaseSensitive(root, "tag_name");
+        if (!cJSON_IsString(tag)) {
+          snprintf(info.error, sizeof(info.error), "release has no tag_name");
+        } else {
+          const char* version = tag->valuestring;
+          if (*version == 'v' || *version == 'V') {
+            ++version;
+          }
+          snprintf(info.latestVersion, sizeof(info.latestVersion), "%s", version);
+          const cJSON* assets = cJSON_GetObjectItemCaseSensitive(root, "assets");
+          const cJSON* asset = nullptr;
+          cJSON_ArrayForEach(asset, assets) {
+            const cJSON* name = cJSON_GetObjectItemCaseSensitive(asset, "name");
+            const cJSON* link = cJSON_GetObjectItemCaseSensitive(asset, "browser_download_url");
+            if (cJSON_IsString(name) && cJSON_IsString(link) &&
+                strcmp(name->valuestring, kReleaseAsset) == 0) {
+              snprintf(info.url, sizeof(info.url), "%s", link->valuestring);
+            }
+          }
+          if (info.url[0] == '\0') {
+            snprintf(info.error, sizeof(info.error), "release %s has no %s asset",
+                     info.latestVersion, kReleaseAsset);
+          } else {
+            info.checked = true;
+            info.newer = isNewerVersion(info.latestVersion, FIRMWARE_VERSION);
+          }
+        }
+        cJSON_Delete(root);
+      }
+    }
+    free(body);
+  }
+  info.checkedAtMs = millis();
+  if (info.checked) {
+    eventLogf("OTA: latest release is %s (%s running v%s)", info.latestVersion,
+              info.newer ? "newer than" : "not newer than", FIRMWARE_VERSION);
+  } else {
+    eventLogf("OTA: release check failed: %s", info.error);
+  }
+  xSemaphoreTake(updateInfoMutex, portMAX_DELAY);
+  updateInfo = info;
+  xSemaphoreGive(updateInfoMutex);
+  out = info;
+  return info.checked;
+}
+
+void otaGetUpdateInfo(OtaUpdateInfo& out) {
+  ensureUpdateMutex();
+  xSemaphoreTake(updateInfoMutex, portMAX_DELAY);
+  out = updateInfo;
+  xSemaphoreGive(updateInfoMutex);
+}
+
+bool otaAutoUpdateEnabled() {
+  if (!autoUpdateLoaded.load()) {
+    Preferences prefs;
+    bool enabled = false;
+    if (prefs.begin(kNvsNamespace, true)) {
+      enabled = prefs.isKey(kNvsAutoKey) && prefs.getUChar(kNvsAutoKey, 0) != 0;
+      prefs.end();
+    }
+    autoUpdateCached = enabled;
+    autoUpdateLoaded = true;
+  }
+  return autoUpdateCached.load();
+}
+
+void otaSetAutoUpdate(bool enabled) {
+  Preferences prefs;
+  if (prefs.begin(kNvsNamespace, false)) {
+    prefs.putUChar(kNvsAutoKey, enabled ? 1 : 0);
+    prefs.end();
+  }
+  autoUpdateCached = enabled;
+  autoUpdateLoaded = true;
+  eventLogf("OTA: automatic updates %s", enabled ? "enabled" : "disabled");
+}
+
+namespace {
+void checkerReport(const char* line, void*) { eventLogf("OTA: %s", line); }
+
+void updateCheckerTask(void*) {
+  uint32_t nextCheckMs = millis() + kFirstCheckDelayMs;
+  while (true) {
+    delay(5000);
+    if (static_cast<int32_t>(millis() - nextCheckMs) < 0 || WiFi.status() != WL_CONNECTED ||
+        !serviceUp.load() || selfTestPending.load()) {
+      continue;
+    }
+    OtaUpdateInfo info;
+    const bool ok = otaCheckForUpdate(info);
+    nextCheckMs = millis() + (ok ? kCheckIntervalMs : kCheckRetryMs);
+    if (!ok || !info.newer || !otaAutoUpdateEnabled()) {
+      continue;
+    }
+    // Automatic install: only when nobody is logged in, so an update never
+    // yanks a console or a bastion relay out from under the owner. Retry
+    // every 5 minutes until the board is idle.
+    while (sshActiveSessions() > 0) {
+      eventLogf("OTA: v%s ready to install, waiting for %u active session(s) to end",
+                info.latestVersion, sshActiveSessions());
+      delay(5 * 60 * 1000);
+    }
+    eventLogf("OTA: installing v%s automatically", info.latestVersion);
+    OtaResult result;
+    if (otaFromUrl(info.url, checkerReport, nullptr, result)) {
+      eventLogf("OTA: %s - rebooting into it", result.message);
+      eventLogPersist("automatic update");
+      delay(1000);
+      ESP.restart();
+    }
+    // Failed: the journal has the reason; try again at the next daily check.
+  }
+}
+}  // namespace
+
+void otaUpdateCheckerStart() {
+  ensureUpdateMutex();
+  if (xTaskCreatePinnedToCore(updateCheckerTask, "ota-check", 6144, nullptr, 1, nullptr, 1) !=
+      pdPASS) {
+    eventLogf("OTA: could not start the release checker task");
   }
 }

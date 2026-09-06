@@ -27,7 +27,7 @@ white for the facts you act on and cyan for labels and command hints. The
 `recovery>` prompt is bold green.
 
 ```text
-  ESP32 Recovery Gateway   v1.3.0   ESP32-S3-N16R8  • reset: power-on
+  ESP32 Recovery Gateway   v1.4.0   ESP32-S3-N16R8  • reset: power-on
   ──────────────────────────────────────────────────────────────────────────────
   Device     ● ONLINE     up 0d 00:07:44
   Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
@@ -80,9 +80,12 @@ Line behavior:
   PSRAM; the state word is `OK` / `TIGHT` / `LOW` for a minimum above
   80 KB / above 50 KB / below.
 - `Firmware` shows the running OTA slot, how many sessions are active out
-  of the maximum and how many have authenticated since boot, and
-  `SELF-TEST` (yellow) while a freshly installed image is still proving
-  itself - see `ota` below.
+  of the maximum and how many have authenticated since boot. The state word
+  is `CONFIRMED`, `SELF-TEST` (yellow) while a freshly installed image is
+  still proving itself, or `UPDATE` (yellow) once the daily release check
+  has found a newer version - `v1.5.0 available: ota upgrade`, or
+  `available, installs when idle` if automatic updates are on. See `ota`
+  below.
 
 ## Top-level help
 
@@ -93,14 +96,14 @@ handlers, so this output cannot drift from what the firmware does. The
 actual `help` output in the current firmware:
 
 ```text
-ESP32 Recovery Gateway v1.3.0 - command reference
+ESP32 Recovery Gateway v1.4.0 - command reference
 
 STATUS
   status               Show the complete dashboard
   watch                Auto-refresh the dashboard every 2 s (any key stops)
   uptime               Show device uptime
   version              Show firmware, board and key fingerprint
-  logs                 Show recent events (logs [n], default 40)
+  logs                 Event journal: logs [n] | logs follow | logs previous
 
 MAIN PC
   pc status            Check the configured PC's SSH port
@@ -118,7 +121,7 @@ VPN
 
 DEVICE
   reboot               Restart the ESP32 (asks for confirmation)
-  ota                  Firmware update: ota status | ota <https-url> | ota rollback yes
+  ota                  Firmware update: ota status | check | upgrade | auto on|off | <url> | rollback yes
 
 HELP
   help                 Show this command list; `help <command>` for details
@@ -226,11 +229,11 @@ through the bastion.
 Clears the screen and redraws the dashboard every 2 seconds until any key
 is pressed. Use it while a PC is waking up or a tunnel is failing over.
 
-### `logs [n]`
+### `logs [n]`, `logs follow`, `logs previous`
 
-Prints the last `n` lines (default 40, up to 256) of the in-memory event
-journal. Every line is prefixed with the device uptime in seconds at the
-moment it was written:
+`logs [n]` prints the last `n` lines (default 40, up to 256) of the
+in-memory event journal. Every line is prefixed with the device uptime in
+seconds at the moment it was written:
 
 ```text
 Event journal (40 of 87 lines, uptime seconds)
@@ -245,10 +248,27 @@ Event journal (40 of 87 lines, uptime seconds)
 
 The journal records state changes, Wi-Fi events with the driver's
 disconnect reason, VPN transitions, SSH logins with the peer address and
-negotiated algorithms, rejected forwarding requests, relay statistics, and
-watchdog/restart decisions. It never contains keys, passwords or profile
-contents. It lives in PSRAM and is lost on reboot; the same lines are
-echoed to the serial console (115200 baud) as they happen.
+negotiated algorithms, rejected forwarding requests, relay statistics,
+release checks and watchdog/restart decisions. It never contains keys,
+passwords or profile contents. It lives in PSRAM; the same lines are echoed
+to the serial console (115200 baud) as they happen.
+
+`logs follow` prints the last 20 lines and then keeps printing new ones as
+they are written, until you press any key - the equivalent of `tail -f`.
+
+`logs previous` prints the journal that was saved to flash before the last
+reboot. The firmware writes its last 120 lines to SPIFFS before every
+planned restart (`reboot`, an OTA install, `ota rollback`, the Wi-Fi-loss
+restart, a factory reset, reopening the portal) and every 10 minutes while
+running, so even after a panic or a watchdog reset the lines leading up to
+it are there:
+
+```text
+Journal saved before the last reboot:
+  # journal saved: periodic snapshot, uptime 3600.012 s, 212 lines written this boot
+  3012.404 Net: NO_INTERNET
+  ...
+```
 
 ### `pc ping [count]`
 
@@ -265,11 +285,25 @@ mechanism is described in
 
 | Form | What it does |
 |---|---|
-| `ssh user@board ota < firmware-signed.bin` | upload the image over the SSH connection (non-interactive mode) |
-| `ota https://host/path/firmware-signed.bin` | the board downloads the image itself (HTTPS only, redirects followed) |
-| `ota status` | running/next slot, both slots' state and image, self-test state, last OTA event |
+| `ota check` | ask GitHub Releases for the latest version now and compare it with the running one |
+| `ota upgrade` | download and install the latest release found by the check (runs a check first if none happened yet) |
+| `ota auto on` / `ota auto off` / `ota auto` | enable, disable or show automatic installation of newer releases (only while no SSH session is active); the same setting as the portal's *Firmware updates* checkbox |
+| `ssh user@board ota < firmware-signed.bin` | upload an image over the SSH connection (non-interactive mode) |
+| `ota https://host/path/firmware-signed.bin` | the board downloads that image itself (HTTPS only, redirects followed) |
+| `ota status` | running/next slot, both slots' state and image, self-test state, last OTA event, last release check, auto-update setting |
 | `ota rollback yes` | boot the other slot's image (if it holds a valid one) |
 | `ota` / `help ota` | usage |
+
+The board checks GitHub Releases by itself two minutes after boot and then
+once a day; a newer release is reported in the dashboard and in `ota status`
+whether or not automatic updates are on:
+
+```text
+recovery> ota check
+
+Asking GitHub Releases ...
+Latest release: v1.5.0. Running: v1.4.0. An update is available - `ota upgrade` installs it.
+```
 
 A successful update ends like this, then the connection closes and the board
 reboots:
@@ -389,8 +423,7 @@ Implemented:
   the connection close instead of waiting for a banner). One channel per
   session: `ssh -J` opens exactly one `direct-tcpip` channel, which is the
   supported pattern; multiplexed sessions (`ControlMaster`, several `-L`
-  forwards on one connection) are not. The legacy prebuilt-core build
-  stays single-session (its mbedTLS has no locking).
+  forwards on one connection) are not.
 - Protection against stalled clients: a 30 s libssh I/O timeout on the
   session (covers a stall during key exchange or authentication) plus
   TCP keepalive as a backstop for a client that vanishes without a FIN;
@@ -409,5 +442,4 @@ Implemented:
 
 Planned:
 
-- suggesting similar commands on a typo;
-- `logs follow` (stream new journal lines until a key is pressed).
+- suggesting similar commands on a typo.

@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: PlatformIO build (esp32-s3-n16r8, custom core)
+    name: PlatformIO build (esp32-s3-n16r8)
     runs-on: ubuntu-latest
     # The default environment rebuilds the ESP-IDF libraries from source on
     # the first run (pioarduino HybridCompile); the cache below keeps that to
@@ -43,15 +43,10 @@ jobs:
         # with the project's sdkconfig) fails under PlatformIO 6.2.0 with
         # "No module named 'SCons.Tool.FortranCommon'"; 6.1.19 is what the
         # firmware is built and tested with locally.
-        # intelhex: needed by the esptool that the legacy espressif32 platform
-        # runs to assemble bootloader.bin.
-        run: pip install "platformio==6.1.19" cryptography intelhex
+        run: pip install "platformio==6.1.19" cryptography
 
-      - name: Build (default, custom core)
+      - name: Build
         run: pio run -e esp32-s3-n16r8
-
-      - name: Build (legacy, prebuilt core)
-        run: pio run -e esp32-s3-n16r8-legacy
 
       - name: Determine version
         id: version
@@ -77,7 +72,7 @@ jobs:
 
       - name: Report size
         run: |
-          ls -l .pio/build/esp32-s3-n16r8/firmware*.bin .pio/build/esp32-s3-n16r8-legacy/firmware.bin
+          ls -l .pio/build/esp32-s3-n16r8/firmware*.bin
 
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
@@ -88,7 +83,6 @@ jobs:
             .pio/build/esp32-s3-n16r8/firmware-signed.bin
             .pio/build/esp32-s3-n16r8/bootloader.bin
             .pio/build/esp32-s3-n16r8/partitions.bin
-            .pio/build/esp32-s3-n16r8-legacy/firmware.bin
           if-no-files-found: error
 
       - name: Publish release assets

@@ -72,7 +72,6 @@ constexpr size_t kRelayBufferSize = 8192;
 // entries a future default might re-add. DH group-exchange is excluded from
 // KEX (multi-second modexp on first connect); every OpenSSH since 2014
 // prefers curve25519 anyway.
-#ifndef BASTION_BENCH_ALL_CIPHERS
 constexpr char kCiphers[] =
     "aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr";
 constexpr char kMacs[] =
@@ -80,7 +79,6 @@ constexpr char kMacs[] =
     "hmac-sha2-512";
 constexpr char kKex[] =
     "curve25519-sha256,curve25519-sha256@libssh.org,ecdh-sha2-nistp256";
-#endif
 
 constexpr char kAnsiReset[] = "\x1b[0m";
 constexpr char kAnsiBold[] = "\x1b[1m";
@@ -120,15 +118,12 @@ std::atomic<uint32_t> authFailures{0};
 //
 // libssh shares one mbedTLS CTR-DRBG between all sessions (every packet's
 // padding draws from it), so concurrent sessions need mbedTLS's internal
-// locking: the default (IDF 5) build enables CONFIG_MBEDTLS_THREADING_C in
-// custom_sdkconfig. The legacy prebuilt core has no such locking and stays
-// single-session.
+// locking; custom_sdkconfig enables CONFIG_MBEDTLS_THREADING_C for that.
 // ---------------------------------------------------------------------------
-#if defined(CONFIG_MBEDTLS_THREADING_C)
-constexpr uint8_t kMaxSessions = 3;
-#else
-constexpr uint8_t kMaxSessions = 1;
+#ifndef CONFIG_MBEDTLS_THREADING_C
+#error "Concurrent SSH sessions need CONFIG_MBEDTLS_THREADING_C (see custom_sdkconfig)"
 #endif
+constexpr uint8_t kMaxSessions = 3;
 constexpr uint8_t kSessionSlots = kMaxSessions + 1;
 // Measured with BASTION_STACK_DIAG on 2026-09-06: peak use 5.4 KB per session
 // (RSA client key, KEX + auth + a 1 MB relay + an HTTPS OTA attempt, which
@@ -420,13 +415,24 @@ void writeDashboard(ssh_channel channel) {
 
   const bool selfTest = otaSelfTestPending();
   const esp_partition_t* running = esp_ota_get_running_partition();
-  snprintf(detail, sizeof(detail), "slot %s%s%s  sessions %u/%u active, %lu total  %s",
+  OtaUpdateInfo update;
+  otaGetUpdateInfo(update);
+  const bool updateAvailable = update.checked && update.newer;
+  snprintf(detail, sizeof(detail), "slot %s%s%s  sessions %u/%u active, %lu total  %s%s%s",
            kAnsiWhite, running != nullptr ? running->label : "?", kAnsiReset,
            activeSessionCount(), kMaxSessions,
            static_cast<unsigned long>(sessionsServed.load()),
-           selfTest ? "confirming this image (Wi-Fi + SSH up) ..." : "");
-  statusRow(channel, "Firmware", selfTest ? kAnsiYellow : kAnsiGreen,
-            selfTest ? "SELF-TEST" : "CONFIRMED", detail);
+           updateAvailable ? kAnsiBoldYellow : "",
+           selfTest ? "confirming this image (Wi-Fi + SSH up) ..."
+                    : (updateAvailable ? "v" : ""),
+           updateAvailable && !selfTest ? update.latestVersion : "");
+  if (updateAvailable && !selfTest) {
+    strncat(detail, otaAutoUpdateEnabled() ? " available, installs when idle" : " available: ota upgrade",
+            sizeof(detail) - strlen(detail) - 1);
+    strncat(detail, kAnsiReset, sizeof(detail) - strlen(detail) - 1);
+  }
+  statusRow(channel, "Firmware", selfTest ? kAnsiYellow : (updateAvailable ? kAnsiYellow : kAnsiGreen),
+            selfTest ? "SELF-TEST" : (updateAvailable ? "UPDATE" : "CONFIRMED"), detail);
 
   writeRule(channel);
   channelPrintf(channel,
@@ -480,11 +486,15 @@ const Command kCommands[] = {
     {"uptime", "STATUS", "Show device uptime", nullptr, cmdUptime},
     {"version", "STATUS", "Show firmware, board and key fingerprint", nullptr,
      cmdVersion},
-    {"logs", "STATUS", "Show recent events (logs [n], default 40)",
-     "Prints the last n lines of the in-memory event journal (up to 256).\r\n"
-     "The journal is secrets-free: state changes, VPN transitions, SSH\r\n"
-     "logins and relay statistics. It is lost on reboot.\r\n"
-     "Example:\r\n  logs 100\r\n",
+    {"logs", "STATUS", "Event journal: logs [n] | logs follow | logs previous",
+     "logs [n]        last n lines of the in-memory journal (default 40, max 256)\r\n"
+     "logs follow     keep printing new lines until any key is pressed\r\n"
+     "logs previous   the journal saved to flash before the last reboot\r\n\r\n"
+     "The journal is secrets-free: state changes, VPN transitions, SSH logins,\r\n"
+     "relay statistics, update checks. The last 120 lines are saved to SPIFFS\r\n"
+     "before every planned restart and every 10 minutes, so a panic or watchdog\r\n"
+     "reset loses at most 10 minutes of history.\r\n"
+     "Example:\r\n  logs 100\r\n  logs previous\r\n",
      cmdLogs},
     {"pc status", "MAIN PC", "Check the configured PC's SSH port", nullptr,
      cmdPcStatus},
@@ -507,13 +517,17 @@ const Command kCommands[] = {
      "Type `reboot yes` to skip the confirmation prompt.\r\n"
      "Provisioned settings are kept; only the current session ends.\r\n",
      cmdReboot},
-    {"ota", "DEVICE", "Firmware update: ota status | ota <https-url> | ota rollback yes",
+    {"ota", "DEVICE", "Firmware update: ota status | check | upgrade | auto on|off | <url> | rollback yes",
      "A/B firmware update into the inactive slot, verified by Ed25519 release\r\n"
      "signature and ESP-IDF image check, with automatic rollback if the new\r\n"
      "image does not bring up Wi-Fi + SSH within 2 minutes.\r\n\r\n"
-     "  ota status                 slots, versions, self-test state\r\n"
+     "  ota status                 slots, versions, self-test, last release check\r\n"
+     "  ota check                  ask GitHub Releases for the latest version now\r\n"
+     "  ota upgrade                install the latest release found by the check\r\n"
+     "  ota auto on|off            install new releases automatically (daily check,\r\n"
+     "                             only while no SSH session is active)\r\n"
      "  ota https://.../firmware-signed.bin\r\n"
-     "                             the board downloads and applies the image\r\n"
+     "                             the board downloads and applies that image\r\n"
      "  ota rollback yes           boot the other slot's image\r\n\r\n"
      "Upload from your machine instead (no internet needed on the board):\r\n"
      "  ssh <user>@<board> ota < firmware-signed.bin\r\n"
@@ -669,6 +683,40 @@ void emitLogLine(const char* line, void* userData) {
 }
 
 bool cmdLogs(ssh_channel channel, const char* args) {
+  if (strcmp(args, "follow") == 0 || strcmp(args, "-f") == 0) {
+    // Print what is there, then stream new lines until a key arrives.
+    LogEmitState state{channel, 0, 0};
+    uint32_t next = eventLogSequence();
+    const uint32_t start = next > 20 ? next - 20 : 0;
+    channelPrintf(channel, "%sFollowing the journal - press any key to stop.%s\r\n", kAnsiDim,
+                  kAnsiReset);
+    next = eventLogForEachSince(start, emitLogLine, &state);
+    while (ssh_channel_is_open(channel) && !ssh_channel_is_eof(channel)) {
+      const int available = ssh_channel_poll_timeout(channel, 500, 0);
+      if (available < 0 || sessionEvicted()) {
+        if (sessionEvicted()) {
+          writeEvictionNotice(channel);
+        }
+        return false;
+      }
+      if (available > 0) {
+        char scratch[64];
+        ssh_channel_read_nonblocking(channel, scratch, sizeof(scratch), 0);
+        return true;
+      }
+      next = eventLogForEachSince(next, emitLogLine, &state);
+    }
+    return true;
+  }
+  if (strcmp(args, "previous") == 0 || strcmp(args, "prev") == 0) {
+    LogEmitState state{channel, 0, 0};
+    channelPrintf(channel, "\r\n%sJournal saved before the last reboot:%s\r\n", kAnsiDim,
+                  kAnsiReset);
+    if (!eventLogPreviousForEach(emitLogLine, &state)) {
+      channelWrite(channel, "  (no saved journal on this device yet)\r\n");
+    }
+    return true;
+  }
   long wanted = *args != '\0' ? strtol(args, nullptr, 10) : 40;
   if (wanted < 1) {
     wanted = 40;
@@ -813,6 +861,7 @@ bool cmdReboot(ssh_channel channel, const char* args) {
     return true;
   }
   eventLogf("SSH: reboot requested by %s", peerName());
+  eventLogPersist("reboot command");
   channelWrite(channel, "\r\nRebooting. Reconnect in ~10 seconds.\r\n");
   ssh_channel_send_eof(channel);
   ssh_channel_close(channel);
@@ -837,6 +886,7 @@ void finishOtaAndReboot(ssh_channel channel, const OtaResult& result) {
                 result.message, FIRMWARE_VERSION);
   eventLogf("OTA: rebooting into %s (v%s) requested by %s", result.targetLabel,
             result.version, peerName());
+  eventLogPersist("firmware update");
   ssh_channel_request_send_exit_status(channel, 0);
   ssh_channel_send_eof(channel);
   ssh_channel_close(channel);
@@ -855,6 +905,78 @@ bool cmdOta(ssh_channel channel, const char* args) {
     char text[640];
     otaDescribeSlots(text, sizeof(text));
     channelPrintf(channel, "\r\n%s", text);
+    OtaUpdateInfo info;
+    otaGetUpdateInfo(info);
+    if (!info.checked && info.error[0] == '\0') {
+      channelWrite(channel, "Release check: not yet (first check ~2 min after boot, then daily)\r\n");
+    } else if (!info.checked) {
+      channelPrintf(channel, "Release check: failed %lu s ago: %s\r\n",
+                    static_cast<unsigned long>((millis() - info.checkedAtMs) / 1000UL), info.error);
+    } else {
+      channelPrintf(channel, "Release check: latest v%s (%s), %lu s ago\r\n", info.latestVersion,
+                    info.newer ? "NEWER - run `ota upgrade`" : "up to date",
+                    static_cast<unsigned long>((millis() - info.checkedAtMs) / 1000UL));
+    }
+    channelPrintf(channel, "Automatic updates: %s\r\n", otaAutoUpdateEnabled() ? "on" : "off");
+    return true;
+  }
+  if (strcmp(args, "check") == 0) {
+    channelWrite(channel, "\r\nAsking GitHub Releases ...\r\n");
+    OtaUpdateInfo info;
+    if (!otaCheckForUpdate(info)) {
+      channelPrintf(channel, "Check failed: %s\r\n", info.error);
+      return true;
+    }
+    channelPrintf(channel, "Latest release: v%s. Running: v%s. %s\r\n", info.latestVersion,
+                  FIRMWARE_VERSION,
+                  info.newer ? "An update is available - `ota upgrade` installs it."
+                             : "You are up to date.");
+    return true;
+  }
+  if (strcmp(args, "upgrade") == 0) {
+    OtaUpdateInfo info;
+    otaGetUpdateInfo(info);
+    if (!info.checked) {
+      channelWrite(channel, "\r\nNo release check yet, asking GitHub ...\r\n");
+      if (!otaCheckForUpdate(info)) {
+        channelPrintf(channel, "Check failed: %s\r\n", info.error);
+        return true;
+      }
+    }
+    if (!info.newer) {
+      channelPrintf(channel, "\r\nAlready up to date (latest release v%s, running v%s).\r\n",
+                    info.latestVersion, FIRMWARE_VERSION);
+      return true;
+    }
+    channelPrintf(channel, "\r\nInstalling v%s from %s\r\n", info.latestVersion, info.url);
+    eventLogf("OTA: upgrade to v%s requested by %s", info.latestVersion, peerName());
+    OtaResult result;
+    if (!otaFromUrl(info.url, otaReportToChannel, channel, result)) {
+      channelPrintf(channel, "\r\nUpdate failed: %s\r\nThe running firmware is unchanged.\r\n",
+                    result.message);
+      return true;
+    }
+    finishOtaAndReboot(channel, result);
+    return false;
+  }
+  if (strncmp(args, "auto", 4) == 0) {
+    const char* value = args + 4;
+    while (*value == ' ') {
+      ++value;
+    }
+    if (strcmp(value, "on") == 0 || strcmp(value, "off") == 0) {
+      otaSetAutoUpdate(strcmp(value, "on") == 0);
+    } else if (*value != '\0') {
+      channelWrite(channel, "\r\nUsage: ota auto on | ota auto off\r\n");
+      return true;
+    }
+    channelPrintf(channel,
+                  "\r\nAutomatic updates are %s. The board checks GitHub Releases once a "
+                  "day%s\r\n",
+                  otaAutoUpdateEnabled() ? "ON" : "OFF",
+                  otaAutoUpdateEnabled()
+                      ? " and installs a newer release as soon as no SSH session is active."
+                      : " and only reports a newer release; install it with `ota upgrade`.");
     return true;
   }
   if (strncmp(args, "rollback", 8) == 0) {
@@ -868,6 +990,7 @@ bool cmdOta(ssh_channel channel, const char* args) {
       return true;
     }
     channelPrintf(channel, "\r\n%s\r\n", message);
+    eventLogPersist("manual rollback");
     ssh_channel_send_eof(channel);
     ssh_channel_close(channel);
     delay(1500);
@@ -887,7 +1010,7 @@ bool cmdOta(ssh_channel channel, const char* args) {
     return false;
   }
   channelWrite(channel,
-               "\r\nUsage: ota status | ota https://<url> | ota rollback yes\r\n"
+               "\r\nUsage: ota status | check | upgrade | auto on|off | https://<url> | rollback yes\r\n"
                "Upload: ssh <user>@<board> ota < firmware-signed.bin\r\n");
   return true;
 }
@@ -1667,13 +1790,11 @@ bool configureAndListen(ssh_bind bind) {
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BINDADDR, kBindAddress);
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BINDPORT_STR, kBindPort);
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_HOSTKEY, kHostKeyVfsPath);
-#ifndef BASTION_BENCH_ALL_CIPHERS
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_CIPHERS_C_S, kCiphers);
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_CIPHERS_S_C, kCiphers);
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_HMAC_C_S, kMacs);
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_HMAC_S_C, kMacs);
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_KEY_EXCHANGE, kKex);
-#endif
   int verbosity = SSH_LOG_WARN;
   ssh_bind_options_set(bind, SSH_BIND_OPTIONS_LOG_VERBOSITY, &verbosity);
   if (ssh_bind_listen(bind) != SSH_OK) {
@@ -1871,6 +1992,8 @@ void sshServerTask(void*) {
   }
 }
 }  // namespace
+
+uint8_t sshActiveSessions() { return activeSessionCount(); }
 
 void startRecoverySshServer() {
   if (xTaskCreatePinnedToCore(sshServerTask, "recovery-ssh", kSshTaskStack,

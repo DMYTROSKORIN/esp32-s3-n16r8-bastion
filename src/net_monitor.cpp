@@ -79,6 +79,7 @@ void netMonitorTask(void*) {
       if (now - wifiLostSinceMs >= kWifiLostRebootMs) {
         eventLogf("Wi-Fi: unassociated for %lu min, restarting to recover the radio",
                   static_cast<unsigned long>(kWifiLostRebootMs / 60000UL));
+        eventLogPersist("wifi-loss restart");
         delay(200);
         ESP.restart();
       }
@@ -100,6 +101,9 @@ void netMonitorTask(void*) {
 
     // Learns/refreshes the PC's MAC once a minute (its own cooldown).
     mainPcMaintain();
+    // Snapshot the journal to SPIFFS every 10 minutes so a panic or watchdog
+    // reset loses at most that much history (`logs previous`).
+    eventLogPersistPeriodically();
     delay(kTickMs);
   }
 }

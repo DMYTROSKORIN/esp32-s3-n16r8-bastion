@@ -160,6 +160,15 @@ details[open] summary::before{content:"–"}
     <p class="err" data-for="wg2_ssh_port"></p>
   </details>
 </section>
+
+<section>
+  <h2>Firmware updates</h2>
+  <label style="display:flex;align-items:center;gap:10px;font-weight:500;cursor:pointer">
+    <input type="checkbox" id="ota_auto" name="ota_auto" style="width:20px;height:20px;margin:0;appearance:auto;-webkit-appearance:auto">
+    Install updates automatically
+  </label>
+  <p class="hint">The device checks the project's GitHub Releases once a day. On: a newer signed firmware is installed as soon as no SSH session is open (with automatic rollback if it fails to start). Off: the console only shows that an update is available and you install it with <code>ota upgrade</code>. Change later with <code>ota auto on|off</code>.</p>
+</section>
 </main>
 
 <div class="applybar" id="applybar"><div>
@@ -180,8 +189,10 @@ const dirty=new Set();
 let firstRun=true,savedSsid="";
 
 function markDirty(n){dirty.add(n)}
-for(const el of document.querySelectorAll("input[name],select[name]"))
+for(const el of document.querySelectorAll("input[name],select[name]")){
   el.addEventListener("input",()=>markDirty(el.name));
+  el.addEventListener("change",()=>markDirty(el.name));
+}
 
 function checkSshKey(text){
   const m=text.match(/^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)\s+([A-Za-z0-9+/=]+)/);
@@ -305,6 +316,7 @@ async function loadConfig(){
       if(d.wg2Set){filePickers["wg2"].setSaved(d.wg2Endpoint);$("wg2box").open=true;if(d.wg2SshPort)$("wg2_ssh_port").value=d.wg2SshPort;}
       fillSsidOptions([]);
     }
+    $("ota_auto").checked=!!d.otaAuto;
   }catch(e){}
 }
 
@@ -336,6 +348,7 @@ $("apply").addEventListener("click",async()=>{
   if(send("wg1_ssh_port"))p.set("wg1_ssh_port",$("wg1_ssh_port").value.trim());
   if(send("wg2"))p.set("wg2",$("wg2").value.trim());
   if(send("wg2_ssh_port"))p.set("wg2_ssh_port",$("wg2_ssh_port").value.trim());
+  if(send("ota_auto"))p.set("ota_auto",$("ota_auto").checked?"1":"0");
   const btn=$("apply");
   const testingWifi=send("ssid")||send("pass");
   btn.disabled=true;

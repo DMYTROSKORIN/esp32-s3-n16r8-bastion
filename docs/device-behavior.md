@@ -3,8 +3,7 @@
 This document describes the **ESP32-S3-N16R8** firmware (16 MB flash, 8 MB
 PSRAM, DevKitC-1 class board with a WS2812 RGB LED on GPIO 48 and the `BOOT`
 button on GPIO 0), built on Arduino core 3.3 / ESP-IDF 5.5 with a custom
-sdkconfig since 1.1.0. Behaviour is identical on the legacy prebuilt-core
-build except for network throughput (see the architecture document).
+sdkconfig.
 
 A single onboard RGB LED shows everything needed to bring the ESP32-S3 up
 and diagnose it without a computer or a serial monitor. Color reports the
@@ -60,8 +59,9 @@ it automatically enters setup mode:
 4. The setup portal usually opens automatically (captive portal). If it
    doesn't, open `http://192.168.4.1` in a browser.
 5. A single page covers everything: the Wi-Fi network and password, the main
-   PC's IP and SSH port, the username, and the public SSH key plus one or two
-   WireGuard profiles — **file upload only** (a "Choose file…" button with
+   PC's IP and SSH port, the username, the public SSH key plus one or two
+   WireGuard profiles, and whether firmware updates may install themselves.
+   Keys and profiles are **file upload only** (a "Choose file…" button with
    inline validation), with no manual paste/typing. This is a deliberate
    choice: on iOS the portal opens inside a stripped-down mini-browser
    (Captive Network Assistant) that loses all form state on any switch to
@@ -178,15 +178,21 @@ The device is meant to sit unattended for months, so it watches itself:
 
 ## Firmware updates
 
-The board updates itself over the air (`ota` in the SSH console, or
-`ssh user@board ota < firmware-signed.bin`). The new image is written to the
-inactive flash slot, verified, and booted; for its first two minutes the
-dashboard's `Firmware` row shows `SELF-TEST` in yellow, then `CONFIRMED`
-once Wi-Fi and SSH are up. If the new image does not get that far, the
-board reboots into the previous firmware by itself. Nothing you provisioned
-is touched by an update. The LED shows the normal boot sequence during this
-(blue breathing, then green); a rollback looks like one extra reboot about
-two minutes after the update. Details in the architecture document.
+The board checks the project's GitHub Releases two minutes after boot and
+once a day after that. A newer version appears in the dashboard's `Firmware`
+row as `UPDATE`; `ota upgrade` installs it. If *Install updates
+automatically* was ticked in the setup portal (or `ota auto on` was run),
+the board installs it by itself as soon as nobody is logged in over SSH.
+Images can also be installed by hand (`ota https://…`, or
+`ssh user@board ota < firmware-signed.bin`). Either way the new image is
+written to the inactive flash slot, verified, and booted; for its first two
+minutes the dashboard's `Firmware` row shows `SELF-TEST` in yellow, then
+`CONFIRMED` once Wi-Fi and SSH are up. If the new image does not get that
+far, the board reboots into the previous firmware by itself. Nothing you
+provisioned is touched by an update. The LED shows the normal boot sequence
+during this (blue breathing, then green); a rollback looks like one extra
+reboot about two minutes after the update. Details in the architecture
+document.
 
 ## Recovery VPN and SSH console
 
@@ -242,14 +248,15 @@ both checks run through WireGuard.
   `8.8.8.8:53` and `8.8.4.4:53`.
 - **Double green:** the device is operating normally.
 - **Device rebooted on its own:** open the SSH console; the dashboard header
-  shows the reset reason and `logs` the last events before it. `brownout`
-  means the USB supply dipped; `task-watchdog` means a task hung and the
-  watchdog recovered the board.
+  shows the reset reason and `logs previous` the journal saved before the
+  reboot (at most 10 minutes are missing after a panic or watchdog reset).
+  `brownout` means the USB supply dipped; `task-watchdog` means a task hung
+  and the watchdog recovered the board; `software` after an `OTA:` line is a
+  firmware update or rollback.
 - **Console feels laggy / btop stutters over VPN:** a single connection is
-  bounded by the TCP window per round-trip: 32 KB on the default firmware,
-  5760 bytes on the legacy prebuilt-core build (see "SSH throughput" in the
-  architecture document). Over the LAN the session should be snappy; if it
-  is not, check RSSI with `net status`.
+  bounded by the 32 KB TCP window per round-trip (see "SSH throughput" in
+  the architecture document). Over the LAN the session should be snappy; if
+  it is not, check RSSI with `net status`.
 - **WoWLAN doesn't wake the PC:** the console shows `NO MAC` on the `WoWLAN`
   line as long as the PC hasn't been seen on the network yet since
   setup/reset — power it on manually once, and the MAC will be remembered

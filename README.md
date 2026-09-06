@@ -5,7 +5,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.3.0-2ea44f.svg"></a>
+  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.4.0-2ea44f.svg"></a>
   <a href=".github/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/DMYTROSKORIN/esp32-s3-n16r8-bastion/build.yml?branch=main&label=build"></a>
   <img alt="Platform" src="https://img.shields.io/badge/board-ESP32--S3--N16R8%20only-e07020.svg">
   <img alt="Framework" src="https://img.shields.io/badge/framework-Arduino%20%2F%20PlatformIO-00979d.svg">
@@ -22,6 +22,15 @@
 > [Provisioning](#provisioning-wi-fi-pc-ssh-key-wireguard) for the reasoning and the trade-off.
 > Review [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md)
 > before exposing this to a network you don't fully trust.
+
+> [!WARNING]
+> **Secure Boot and Flash Encryption are deliberately not enabled.** Anyone with the board in hand
+> can flash any firmware over USB and read the Wi-Fi password, the WireGuard private keys and the SSH
+> host key straight out of the flash chip. OTA images are signed, USB images are not. This is an
+> accepted risk for a board that lives next to the PC it protects, in a place where physical access
+> already means access to that PC; it is the wrong trade for a board in a shared or public space.
+> The reasoning and what enabling them would cost are in
+> [docs/recovery-access-architecture.md](docs/recovery-access-architecture.md#secrets-at-rest-and-secure-boot-deliberately-not-enabled).
 
 ## What is this?
 
@@ -61,7 +70,7 @@ before attempting a port.
 The SSH console opens straight into a live status dashboard — no separate monitoring needed:
 
 ```text
-  ESP32 Recovery Gateway   v1.3.0   ESP32-S3-N16R8  • reset: power-on
+  ESP32 Recovery Gateway   v1.4.0   ESP32-S3-N16R8  • reset: power-on
   ──────────────────────────────────────────────────────────────────────────────
   Device     ● ONLINE     up 0d 00:07:44
   Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
@@ -76,10 +85,11 @@ The SSH console opens straight into a live status dashboard — no separate moni
 ```
 
 Beyond the dashboard the console offers `watch` (auto-refresh), `logs` (a secrets-free event
-journal: Wi-Fi disconnect reasons, VPN transitions, every SSH login and relay close), `pc ping`,
-`pc wake`, `vpn failover` / `vpn retry-primary`, `ota` and `reboot` — all with `help <command>`
-generated from the same table that dispatches them. Arrow keys recall history. Any command also
-runs non-interactively: `ssh user@192.168.1.120 logs 50`.
+journal: Wi-Fi disconnect reasons, VPN transitions, every SSH login and relay close; `logs follow`
+streams it, `logs previous` shows what was saved before the last reboot), `pc ping`, `pc wake`,
+`vpn failover` / `vpn retry-primary`, `ota` and `reboot` — all with `help <command>` generated from
+the same table that dispatches them. Arrow keys recall history. Any command also runs
+non-interactively: `ssh user@192.168.1.120 logs 50`.
 
 A single onboard RGB LED mirrors the same state without a computer in reach at all — see
 [LED status at a glance](#led-status-at-a-glance) below.
@@ -90,12 +100,11 @@ Open the directory in VS Code with the PlatformIO extension, then use the Platfo
 action (or `pio run -t upload` / `pio run -t upload -t monitor`). The serial monitor runs at
 115200 baud; PlatformIO auto-detects the upload port.
 
-The default environment builds the ESP-IDF libraries from source with this project's `sdkconfig`
-overrides (pioarduino "HybridCompile"), which is what lifts lwIP's TCP window from 5760 bytes to
-32 KB. The **first build downloads the IDF toolchain and compiles the IDF once — expect 10-20
-minutes**; later builds take seconds until `custom_sdkconfig` changes. `pio run -e
-esp32-s3-n16r8-legacy` builds the same firmware on the stock prebuilt core in under a minute, with
-the old 5760-byte window, if you need a quick fallback.
+The build compiles the ESP-IDF libraries from source with this project's `sdkconfig` overrides
+(pioarduino "HybridCompile"): that is what lifts lwIP's TCP window from 5760 bytes to 32 KB and
+enables the mbedTLS locking that concurrent SSH sessions need. The **first build downloads the IDF
+toolchain and compiles the IDF once — expect 10-20 minutes**; later builds take seconds until
+`custom_sdkconfig` changes (delete the generated `sdkconfig.esp32-s3-n16r8` after editing it).
 
 Handing this off to an AI coding agent (Claude Code, Codex CLI, etc.) instead? Point it at
 [docs/agent-flashing.md](docs/agent-flashing.md) — it covers finding the port, building, flashing,
@@ -161,9 +170,13 @@ Details, the measurement method and the remaining limits are in
 
 ## Updating the firmware over the air
 
-Once a board runs 1.2.0 or later it never needs the USB cable again. Download `firmware-signed.bin`
-from the [release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) you want and
-either push it over SSH from wherever you can reach the console:
+Once a board runs 1.2.0 or later it never needs the USB cable again. The board checks the
+project's GitHub Releases once a day; a newer version shows up in the dashboard's `Firmware` row
+and `ota upgrade` installs it. Tick *Install updates automatically* in the setup portal (or run
+`ota auto on`) and the board installs new releases by itself, as soon as no SSH session is open.
+Alternatively download `firmware-signed.bin` from the
+[release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) you want and either push
+it over SSH from wherever you can reach the console:
 
 ```sh
 ssh user@10.66.0.2 ota < firmware-signed.bin
@@ -260,9 +273,9 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 | | |
 |---|---|
 | Board | **ESP32-S3-N16R8** (16 MB QIO flash, 8 MB OPI PSRAM), DevKitC-1 class — the only supported variant |
-| Firmware | v1.3.0 — see [CHANGELOG.md](CHANGELOG.md); signed OTA images on every [release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) |
-| Framework | Arduino core 3.3.11 / ESP-IDF 5.5.5 via [pioarduino](https://github.com/pioarduino/platform-espressif32) 55.03.311, IDF rebuilt with `custom_sdkconfig`, `-O2`; legacy env on `espressif32 @ 7.0.1` (Arduino 2.0.17) |
-| CI | [GitHub Actions](.github/workflows/build.yml) builds both environments on every push, signs the OTA image and publishes the release assets on `v*` tags |
+| Firmware | v1.4.0 — see [CHANGELOG.md](CHANGELOG.md); signed OTA images on every [release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) |
+| Framework | Arduino core 3.3.11 / ESP-IDF 5.5.5 via [pioarduino](https://github.com/pioarduino/platform-espressif32) 55.03.311, IDF rebuilt with `custom_sdkconfig`, `-O2` |
+| CI | [GitHub Actions](.github/workflows/build.yml) builds on every push, signs the OTA image and publishes the release assets on `v*` tags |
 | SSH server | [LibSSH-ESP32](https://github.com/ewpa/LibSSH-ESP32) (Arduino port of libssh) |
 | WireGuard client | [esphome-libs/wireguard](https://github.com/esphome-libs/wireguard) (`esp_wireguard`/`wireguardif`) |
 | Docs | [Recovery architecture](docs/recovery-access-architecture.md) · [Device behavior & LED](docs/device-behavior.md) · [CLI reference](docs/cli-reference.md) · [Flashing for AI agents](docs/agent-flashing.md) |
@@ -272,8 +285,9 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 This is a personal-infrastructure project first, but issues and pull requests are welcome, in
 particular around:
 
-- `ota check`: let the board find the latest release on GitHub by itself
-- Hardening for production deployment (Secure Boot V2, Flash Encryption, per-device signing)
+- Secure Boot V2 / Flash Encryption as an opt-in build profile for boards that leave a trusted room
+  (see the warning above and the architecture document)
+- A password-protected setup network as an option
 
 Please keep the runtime-provisioning model intact — no secrets should ever need to be baked into
 the firmware or committed to this repository.

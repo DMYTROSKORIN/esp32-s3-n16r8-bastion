@@ -34,7 +34,7 @@ memory or flash layout assumes exactly that part:
 | 16 MB flash, QIO @ 80 MHz | `default_16MB.csv`: two 6.25 MB OTA app slots (`app0`/`app1`), 3.4 MB SPIFFS (SSH host key), 64 KB coredump, NVS at 0x9000 (provisioned settings, learned MAC, boot counter). The stock `default_8MB.csv` of the DevKitC-1 board definition would waste half the chip. |
 | 8 MB PSRAM, OPI @ 80 MHz | `board_build.arduino.memory_type = qio_opi`; `heap_caps_malloc_extmem_enable(512)` sends every allocation of 512 B or more to PSRAM, which is what keeps libssh's per-packet buffers from fragmenting the ~320 KB of internal RAM under sustained traffic. The event journal (40 KB) lives there too. Internal RAM is reserved for what must be fast: task stacks, lwIP/Wi-Fi buffers, the two 8 KB relay buffers. |
 | CPU 240 MHz, dual core | Core 0: Wi-Fi driver, lwIP `tcpip_thread`, SSH server task. Core 1: Arduino loop (LED, button, watchdog feed), `net-monitor`, `recovery-vpn`. |
-| Custom-built core | Arduino 3.3.11 / ESP-IDF 5.5.5 (pioarduino 55.03.311) with the IDF libraries rebuilt from source: lwIP TCP window and send buffer 32 KB, receive mailbox 32, SACK, `tcpip_thread` stack 6 KB, 12/64 static/dynamic Wi-Fi RX buffers, 16 static TX, BA window 24, dynamic Wi-Fi/lwIP pools in PSRAM, Wi-Fi/lwIP hot paths in IRAM, `-O2`. See `custom_sdkconfig` in `platformio.ini`; the legacy environment documents what the stock core gives instead. |
+| Custom-built core | Arduino 3.3.11 / ESP-IDF 5.5.5 (pioarduino 55.03.311) with the IDF libraries rebuilt from source: lwIP TCP window and send buffer 32 KB, receive mailbox 32, SACK, `tcpip_thread` stack 6 KB, 12/64 static/dynamic Wi-Fi RX buffers, 16 static TX, BA window 24, dynamic Wi-Fi/lwIP pools in PSRAM, Wi-Fi/lwIP hot paths in IRAM, `-O2`. See `custom_sdkconfig` in `platformio.ini`. |
 | Hardware AES / SHA / MPI | mbedTLS uses the S3's accelerators for AES (all SSH ciphers offered), SHA-256/512 (MACs, KEX hashes) and big-number math (ECDH). chacha20-poly1305 is not part of this libssh/mbedTLS build (the Arduino core omits mbedTLS's CHACHAPOLY module) and is not offered - see "SSH throughput" below. |
 
 The boot banner prints what it actually found (`flash 16 MB QIO @ 80 MHz |
@@ -215,10 +215,9 @@ A fifth simultaneous connection is refused at accept time.
 
 Concurrency requires mbedTLS's internal locking: libssh shares one
 CTR-DRBG between sessions (every packet's padding draws from it) and the
-hardware AES/SHA drivers share contexts. The default build therefore sets
-`CONFIG_MBEDTLS_THREADING_C` / `CONFIG_MBEDTLS_THREADING_PTHREAD` in
-`custom_sdkconfig`; the legacy prebuilt core has no such option and keeps
-`kMaxSessions = 1`. Shared firmware state touched from sessions is either
+hardware AES/SHA drivers share contexts. `custom_sdkconfig` therefore sets
+`CONFIG_MBEDTLS_THREADING_C` / `CONFIG_MBEDTLS_THREADING_PTHREAD`, and the
+source refuses to compile without them. Shared firmware state touched from sessions is either
 atomic, per-session (`thread_local` context, per-session relay buffers in
 PSRAM, per-session command history) or serialised (`pc ping`, and only one
 OTA image in flight at a time).
@@ -263,7 +262,7 @@ PC ──TCP──▶ ESP32 lwIP rx (32 KB window) ──▶ relay buffer (8 KB)
         ──▶ lwIP tx (32 KB send buffer) ──▶ Wi-Fi ──▶ [WireGuard: chacha20 in software] ──▶ client
 ```
 
-(5760 B for both buffers on the legacy prebuilt-core environment.)
+(5760 B for both buffers on the stock prebuilt Arduino core, which this project used up to 1.0.0.)
 
 What the firmware does to keep that path fast and, above all, stable:
 
@@ -309,7 +308,7 @@ What the firmware does to keep that path fast and, above all, stable:
   Wi-Fi driver buffers sized to match. The table shows what the window alone
   allows; the link and CPU are the next limits.
 
-| Path | Typical RTT | Bound with 5760 B (1.0.0 / legacy env) | Bound with 32 KB (1.1.0) |
+| Path | Typical RTT | Bound with 5760 B (up to 1.0.0) | Bound with 32 KB (since 1.1.0) |
 |---|---|---|---|
 | Same LAN | 2-7 ms | 0.8-2.9 MB/s | CPU/link-bound |
 | Through WireGuard, nearby server | 20-30 ms | 190-290 KB/s | 1.1-1.6 MB/s |
@@ -413,6 +412,29 @@ only then `esp_ota_set_boot_partition()` points the bootloader at the new
 slot. A rejected image leaves the running firmware and the other slot
 untouched; the SSH exec exits with status 1 and the reason. Uploaded
 non-images are rejected on the first chunk (ESP image magic byte).
+
+### Release check and automatic updates
+
+Two minutes after boot, and then every 24 hours, a low-priority task asks
+`https://api.github.com/repos/<OTA_GITHUB_REPO>/releases/latest` (the
+repository is a build flag in `platformio.ini`, so forks point it at
+themselves) for the latest tag and the download URL of its
+`firmware-signed.bin` asset. The tag is compared numerically with
+`FIRMWARE_VERSION` (pre-release and build suffixes are ignored). The result
+feeds the dashboard's `Firmware` row (`UPDATE v1.5.0 available`), `ota
+status`, and the journal; `ota check` runs it on demand and `ota upgrade`
+installs what it found. A failed check (no internet, GitHub down, rate
+limit) is retried after an hour and never blocks anything else.
+
+Automatic installation is opt-in: the setup portal's *Firmware updates*
+checkbox or `ota auto on`, stored as its own NVS key (`recovery/ota_auto`)
+so that the `DeviceConfig` layout - and therefore existing provisioning -
+is untouched. With it on, a newer release is installed only when no SSH
+session is active; the checker re-tests every five minutes until the board
+is idle, so an update never ends a console or a relay under the owner.
+Everything else is the normal OTA path: signature check, image validation,
+self-test, rollback. The default is off: the board reports, the owner
+decides.
 
 ### Self-test and rollback
 
@@ -641,13 +663,20 @@ to set a password on the AP (`WiFi.softAP(kApName, password)` in
 `src/setup_portal.cpp`) or to provision the device physically in a space
 where stray Wi-Fi clients are excluded. Neither has been done as of now.
 
-### Secrets at rest: no NVS/Flash encryption, deliberately
+### Secrets at rest and Secure Boot: deliberately not enabled
+
+> **Decision (2026-09-06): Secure Boot V2 and Flash Encryption stay off.**
+> The risk this leaves open is real and must be weighed for every deployment:
+> anyone holding the board can flash arbitrary firmware over USB (the OTA
+> signature check does not cover USB), and can read the Wi-Fi password, both
+> WireGuard private/preshared keys and the SSH host key out of the flash chip
+> with `esptool.py read_flash`. Revisit this the moment a board is deployed
+> anywhere physical access is not equivalent to access to the PC it guards.
 
 The Wi-Fi password, both WireGuard private/preshared keys, and the SSH host
 key are stored unencrypted — the Wi-Fi password and WireGuard keys in the
 NVS blob (`src/device_config.cpp`), the SSH host key as a plain file on
-SPIFFS (`src/recovery_ssh.cpp`). Anyone with the board in hand and a
-`esptool.py read_flash` can pull all of it straight out of SPI flash.
+SPIFFS (`src/recovery_ssh.cpp`).
 
 ESP32-S3 has real answers to this — NVS Encryption and Flash Encryption V2,
 both backed by keys burned into eFuse — and they were deliberately not
@@ -669,10 +698,20 @@ enabled here:
   permanent, irreversible complication to the build/flash/reprovision
   workflow.
 
-If a future deployment puts the board somewhere physical access by an
-untrusted party is actually plausible, that changes the calculus and this
-section should be revisited — Flash Encryption V2 plus NVS Encryption would
-be the right tool then, accepted one-way cost and all.
+Secure Boot V2 sits in the same category: it would make the bootloader
+verify every application image against a key burned into eFuse, closing the
+"flash anything over USB" gap and extending the OTA signature guarantee to
+the whole chain. Its cost is the same irreversibility - every image,
+including development builds and anything an AI agent flashes for you, must
+be signed with a key that must never be lost - plus a "release mode" that
+disables the USB download path entirely. With two boards shared between
+several projects, that trade was judged wrong for now.
+
+If a future deployment puts a board somewhere physical access by an
+untrusted party is actually plausible, that changes the calculus: Secure
+Boot V2 plus Flash Encryption plus NVS Encryption would be the right tools
+then, accepted one-way cost and all, tried first on a spare board in
+development mode.
 
 ## Reliability
 
@@ -696,16 +735,21 @@ Implemented:
 - an in-memory event journal (`logs`) with uptime stamps: Wi-Fi events with
   the driver's disconnect reason, `Net:` transitions, VPN transitions, SSH
   logins with peer address and negotiated algorithms, rejected forwarding
-  requests, relay close reasons with byte counts, and every restart decision;
+  requests, relay close reasons with byte counts, update checks and every
+  restart decision. `logs follow` streams it live;
+- the journal survives reboots: its last 120 lines are written to SPIFFS
+  (`/journal.prev`, via a temporary file so a reset mid-write cannot corrupt
+  the previous snapshot) before every planned restart and every 10 minutes
+  by the network monitor; `logs previous` prints them. A panic or watchdog
+  reset therefore loses at most 10 minutes of history;
 - **all `esp_wireguard` calls run on lwIP's `tcpip_thread`** (marshalled with
   `tcpip_callback()` + a semaphore, see `onLwipThread()` in
   `recovery_vpn.cpp`). The library calls `netif_add/remove/set_default`, the
   raw UDP API, `dns_gethostbyname()` and `sys_timeout()` directly; lwIP
-  requires all of those to run on its own thread (or under its core lock,
-  which the legacy Arduino 2.x build does not enable; the IDF 5 build has
-  `CONFIG_LWIP_TCPIP_CORE_LOCKING=y`, and the marshalling is correct under
-  both), and the previous code called them from the VPN task on core 1 while
-  `tcpip_thread` on core 0 was servicing Wi-Fi traffic.
+  requires all of those to run on its own thread (or under its core lock;
+  the build has `CONFIG_LWIP_TCPIP_CORE_LOCKING=y`, and the marshalling is
+  correct either way), and the previous code called them from the VPN task
+  on core 1 while `tcpip_thread` on core 0 was servicing Wi-Fi traffic.
   All of the wrapped calls are non-blocking (`connect()` reports an
   in-flight DNS lookup as `ESP_ERR_RETRY`), so the hop costs one context
   switch and never stalls packet processing;
@@ -786,12 +830,10 @@ Implemented:
   "Reliability" above). What remains is the library's *internal* behaviour,
   which was always correct: its receive path and timers already ran on
   `tcpip_thread`;
-- `tcpip_thread` has a 2560-byte stack in the *legacy* (prebuilt) build
-  (`CONFIG_LWIP_TCPIP_TASK_STACK_SIZE`); the default 1.1.0 build gives it
-  6144 bytes. `esp_wireguard_connect()` runs there and performs the X25519
-  key derivation for the new interface - the same amount of stack the
-  library's own handshake-response handler already used on that thread, so
-  no new worst case, but on the legacy build the headroom is not generous.
+- `tcpip_thread` runs `esp_wireguard_connect()`, including the X25519 key
+  derivation for the new interface, on its 6144-byte stack
+  (`CONFIG_LWIP_TCPIP_TASK_STACK_SIZE` in `custom_sdkconfig`; the stock core
+  gave it 2560). Measured headroom after connect: 4.3 KB.
   `-DBASTION_STACK_DIAG` logs the high-water mark for verification;
 - a narrow race in the ARP lookup (`main_pc.cpp`): after draining a stale
   semaphore token, there remains a theoretical chance that a callback from
@@ -811,13 +853,13 @@ Implemented:
 
 Planned:
 
-- a persisted copy of the last N journal lines across a watchdog reboot
-  (the last OTA event already survives in NVS);
+- capturing the panic backtrace itself into the saved journal (today only
+  the 10-minute snapshot before it survives);
 - keeping the last known-good configuration until a new one is verified;
 - a stable, independent power supply (brownout resets are already detected
   by the chip and show up as `reset: brownout` in the dashboard and journal);
-- for production: Secure Boot V2 and Flash Encryption (signed OTA updates
-  exist since 1.2.0).
+- Secure Boot V2 and Flash Encryption as an opt-in build profile - see
+  "Secrets at rest and Secure Boot" for why they are off by default.
 
 ## Implementation stages
 
@@ -917,6 +959,6 @@ Lessons from debugging on 2026-08-25/26 — check in this order:
 - an end-to-end test of the ESP32 actually waking the PC via Magic Packet
   (ARP-based MAC learning has already been verified on a live device — see
   "Wake-on-Wireless LAN" above);
-- whether the legacy (prebuilt-core) environment should be kept beyond 1.1.x
-  now that the custom-built core is the default, given that every change has
-  to be verified twice while it exists.
+- whether the daily release check should also pin a minimum version (today
+  any correctly signed release installs, including older ones, which is what
+  makes `ota rollback` and re-installing a previous release possible).
