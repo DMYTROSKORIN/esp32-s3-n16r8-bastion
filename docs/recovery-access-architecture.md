@@ -32,7 +32,7 @@ memory or flash layout assumes exactly that part:
 | Resource | How it is used |
 |---|---|
 | 16 MB flash, QIO @ 80 MHz | `default_16MB.csv`: two 6.25 MB OTA app slots (`app0`/`app1`), 3.4 MB SPIFFS (SSH host key), 64 KB coredump, NVS at 0x9000 (provisioned settings, learned MAC, boot counter). The stock `default_8MB.csv` of the DevKitC-1 board definition would waste half the chip. |
-| 8 MB PSRAM, OPI @ 80 MHz | `board_build.arduino.memory_type = qio_opi`; `heap_caps_malloc_extmem_enable(512)` sends every allocation of 512 B or more to PSRAM, which is what keeps libssh's per-packet buffers from fragmenting the ~320 KB of internal RAM under sustained traffic. The event journal (40 KB) lives there too. Internal RAM is reserved for what must be fast: task stacks, lwIP/Wi-Fi buffers, the two 8 KB relay buffers. |
+| 8 MB PSRAM, OPI @ 80 MHz | `board_build.arduino.memory_type = qio_opi`; `heap_caps_malloc_extmem_enable(256)` sends every plain allocation of 256 B or more to PSRAM, which is what keeps libssh's per-packet buffers from fragmenting the ~320 KB of internal RAM under sustained traffic. The event journal (40 KB) and the per-session relay buffers (2 x 8 KB each) live there too. Internal RAM is reserved for what must be fast or DMA-capable: task stacks, static Wi-Fi buffers, lwIP's own pools. |
 | CPU 240 MHz, dual core | Core 0: Wi-Fi driver, lwIP `tcpip_thread`, SSH server task. Core 1: Arduino loop (LED, button, watchdog feed), `net-monitor`, `recovery-vpn`. |
 | Custom-built core | Arduino 3.3.11 / ESP-IDF 5.5.5 (pioarduino 55.03.311) with the IDF libraries rebuilt from source: lwIP TCP window and send buffer 32 KB, receive mailbox 32, SACK, `tcpip_thread` stack 6 KB, 12/64 static/dynamic Wi-Fi RX buffers, 16 static TX, BA window 24, dynamic Wi-Fi/lwIP pools in PSRAM, Wi-Fi/lwIP hot paths in IRAM, `-O2`. See `custom_sdkconfig` in `platformio.ini`. |
 | Hardware AES / SHA / MPI | mbedTLS uses the S3's accelerators for AES (all SSH ciphers offered), SHA-256/512 (MACs, KEX hashes) and big-number math (ECDH). chacha20-poly1305 is not part of this libssh/mbedTLS build (the Arduino core omits mbedTLS's CHACHAPOLY module) and is not offered - see "SSH throughput" below. |
@@ -173,7 +173,7 @@ labels, a green/yellow/red ● and state word per line, the facts you act on
 in bright white, rules as wide as the client's terminal):
 
 ```text
-  ESP32 Recovery Gateway   v1.2.0   ESP32-S3-N16R8  • reset: power-on
+  ESP32 Recovery Gateway   v1.4.0   ESP32-S3-N16R8  • reset: power-on
   ──────────────────────────────────────────────────────────────────────────────
   Device     ● ONLINE     up 0d 00:07:44
   Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
@@ -181,8 +181,8 @@ in bright white, rules as wide as the client's terminal):
   WireGuard  ● ONLINE     profile-1  10.66.0.2  handshake 10 s ago
   Main PC    ● ONLINE     192.168.1.200:22  ssh open
   WoWLAN     ● STANDBY    aa:bb:cc:dd:ee:ff
-  Memory     ● OK         heap 121 KB (min 114)  psram 8117/8192 KB
-  Firmware   ● CONFIRMED  slot app0  sessions 3
+  Memory     ● OK         heap 124 KB (min 119)  psram 8095/8192 KB
+  Firmware   ● CONFIRMED  slot app0  sessions 1/3 active, 3 total
   ──────────────────────────────────────────────────────────────────────────────
   help commands   pc ssh reach the PC   pc wake wake it up   ota update
 ```
@@ -192,9 +192,10 @@ reason for the last reset (red when it was a panic, watchdog or brownout).
 The `VPN errors` line only appears after consecutive health-check failures.
 `WoWLAN` shows `READY` when the main PC is offline and can be woken, and
 `STANDBY` once the PC is already online. `Memory` grades the free internal
-heap by its low-water mark since boot. `Firmware` shows the running OTA slot
-and whether a freshly installed image is still in its self-test. The exact
-line semantics are in [cli-reference.md](cli-reference.md).
+heap by its low-water mark since boot. `Firmware` shows the running OTA slot,
+active/total sessions, whether a freshly installed image is still in its
+self-test, and `UPDATE` once the daily release check has found a newer
+version. The exact line semantics are in [cli-reference.md](cli-reference.md).
 
 ### Session pool
 
@@ -278,16 +279,16 @@ What the firmware does to keep that path fast and, above all, stable:
   connect).
 - **`select()`-driven relay.** `relayDirectTcpip()` blocks in `select()` on
   the SSH socket and a raw lwIP socket to the PC instead of polling both ends
-  every millisecond. A burst is moved in up to 8 KB slices from buffers allocated
-  once in internal RAM. Both sockets have `TCP_NODELAY` (interactive
+  every millisecond. A burst is moved in up to 8 KB slices through per-session
+  buffers in PSRAM. Both sockets have `TCP_NODELAY` (interactive
   keystrokes and small redraws never wait for Nagle) and TCP keepalive.
 - **Blocking channel writes.** `ssh_channel_write()` runs in blocking mode so
   the client's SSH window and TCP flow control back-pressure the PC through
   the relay, instead of libssh buffering output unboundedly (the original
   `ssh_socket_write: Out of memory` failure under btop). A write that makes
   no progress for 30 s ends the relay with a journaled reason.
-- **PSRAM for libssh.** Allocations of 512 B and up go to PSRAM; the tiny
-  internal heap no longer fragments under a high packet rate.
+- **PSRAM for libssh.** Plain allocations of 256 B and up go to PSRAM; the
+  tiny internal heap no longer fragments under a high packet rate.
 - **Radio awake.** Wi-Fi modem power-save is off (`WIFI_PS_NONE`). Measured
   on the bench (2026-09-05): idle ICMP RTT to the board 5.6 ms average with
   the radio awake versus 70 ms average (9-140 ms) with modem-sleep, because

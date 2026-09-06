@@ -55,10 +55,10 @@ quad-SPI flash** and **8 MB octal PSRAM**, on a DevKitC-1 class board (WS2812 RG
 | | N16R8 setting | Why it matters |
 |---|---|---|
 | Flash | 16 MB, QIO @ 80 MHz, `default_16MB.csv` | two 6.25 MB OTA slots + 3.4 MB SPIFFS; the board default (`default_8MB.csv`) would leave half the chip unused |
-| PSRAM | 8 MB OPI (`memory_type = qio_opi`), allocations ≥ 512 B go there | libssh's per-packet buffers stop fragmenting the ~320 KB internal heap under btop-class traffic; the event journal lives there too |
+| PSRAM | 8 MB OPI (`memory_type = qio_opi`), every plain allocation ≥ 256 B goes there | libssh's per-packet buffers stop fragmenting the ~320 KB internal heap under btop-class traffic; the event journal and the per-session relay buffers live there too |
 | CPU | 240 MHz, both cores in use | Wi-Fi/lwIP/SSH on core 0; LED, network monitor and WireGuard on core 1 |
 | Crypto | hardware AES, SHA, big-number unit | only AES ciphers are offered over SSH, all hardware-accelerated; chacha20 is not part of this libssh/mbedTLS build |
-| Core | pioarduino 55.03.311 (Arduino 3.3.11 / ESP-IDF 5.5.5), IDF libraries rebuilt from source with `custom_sdkconfig` | lwIP TCP window 32 KB instead of the prebuilt core's 5760 B, SACK, 6 KB `tcpip_thread` stack, Wi-Fi/lwIP hot paths in IRAM, everything at `-O2` |
+| Core | pioarduino 55.03.311 (Arduino 3.3.11 / ESP-IDF 5.5.5), IDF libraries rebuilt from source with `custom_sdkconfig` | lwIP TCP window 32 KB instead of the prebuilt core's 5760 B, SACK, 6 KB `tcpip_thread` stack, mbedTLS locking for concurrent SSH sessions, Wi-Fi/lwIP hot paths in IRAM, everything at `-O2` |
 
 The boot log prints what it found (`flash 16 MB QIO @ 80 MHz | PSRAM 8192 KB | SDK 5.5.5`) and warns if the
 chip is not an N16R8. Other ESP32-S3 variants (N8R2, N16R2, N8…) are **not supported** by this
@@ -113,7 +113,8 @@ it can't do for you: the setup portal wizard needs a human on Wi-Fi.
 
 The firmware is fully provisioned at runtime — nothing is baked into the build. On first boot (or
 after a factory reset) it opens an open access point, `ESP32_SetUp`, with a lightweight captive
-setup page covering Wi-Fi, the main PC's address, SSH access, and up to two WireGuard profiles.
+setup page covering Wi-Fi, the main PC's address, SSH access, up to two WireGuard profiles, and
+whether firmware updates may install themselves.
 Applying the form saves everything to NVS and reboots into normal operation. See
 [docs/device-behavior.md](docs/device-behavior.md) for the full flow, the LED state machine, and the
 `BOOT`-button hold tiers (5 s reopens the portal pre-filled with the current settings, 10 s wipes the
@@ -153,7 +154,7 @@ The relay is built for sustained TUI traffic, not just keystrokes:
   chacha20-poly1305 is not compiled into this libssh/mbedTLS build at all, so OpenSSH clients land on
   AES-GCM without any configuration.
 - **`select()`-driven relay** on the SSH socket and a raw lwIP socket to the PC: no millisecond
-  polling, 8 KB internal-RAM buffers per direction, `TCP_NODELAY` and keepalive on both sockets.
+  polling, 8 KB per-session buffers, `TCP_NODELAY` and keepalive on both sockets.
 - **Back-pressure instead of buffering.** Channel writes are blocking so the client's SSH window
   throttles the PC through the relay; a write that makes no progress for 30 s ends the relay with a
   journaled reason instead of exhausting memory (the original `btop` failure mode).
@@ -185,7 +186,7 @@ ssh user@10.66.0.2 ota < firmware-signed.bin
 or let the board fetch it itself, from the console:
 
 ```text
-recovery> ota https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases/download/v1.2.0/firmware-signed.bin
+recovery> ota https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases/download/v1.4.0/firmware-signed.bin
 ```
 
 Either way the image streams into the inactive OTA slot, is verified (Ed25519 release signature +
@@ -209,6 +210,8 @@ or on the build machine:
   each a standard wg-quick client `.conf` loaded from a file. Either profile can be removed with its
   own button — removing the primary also clears the secondary, since a secondary without a primary
   is invalid. This firmware requires `AllowedIPs` to include `0.0.0.0/0` (full tunnel).
+- **Firmware updates**: whether the board may install new releases automatically (off by default;
+  the daily check and the dashboard notice happen either way). Changeable later with `ota auto`.
 
 The browser performs a lightweight format check as soon as a file is picked (key type, `.conf`
 section headers). On **Apply**, the firmware performs the authoritative validation before saving

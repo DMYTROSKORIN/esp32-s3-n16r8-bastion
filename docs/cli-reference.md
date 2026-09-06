@@ -49,8 +49,8 @@ Line behavior:
   the target board and the reason for the last reboot (power-on / software
   / panic / interrupt-watchdog / task-watchdog / watchdog / brownout /
   other) - green for the expected reasons, red for the rest. A
-  `task-watchdog` there means the 60 s software watchdog fired — see `logs`
-  for what preceded it.
+  `task-watchdog` there means the 60 s software watchdog fired — see
+  `logs previous` for what preceded it.
 - The horizontal rules span the width the SSH client reported in its
   `pty-req` (clamped to 48-100 columns) and follow window resizes.
 - Colour carries meaning throughout: labels are cyan, the ● and state word
@@ -347,8 +347,8 @@ Rebooting. Reconnect in ~10 seconds.
 ```
 
 Provisioned settings, the learned MAC and the host key are kept. The
-request is written to the journal (which the reboot then discards) and to
-the serial console.
+journal is saved to flash first, so `logs previous` after the reboot shows
+the request and everything before it.
 
 ## Ready-made scenarios
 
