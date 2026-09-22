@@ -62,6 +62,23 @@ every item below closes a gap a review found.
   `MBEDTLS_DEFAULT_MEM_ALLOC` lets the 256-byte PSRAM threshold that already
   governs libssh apply to mbedTLS as well.
 
+### Tested on the bench
+
+- CI image `1.4.2+ecf07e8` installed over SSH onto a board running 1.4.1:
+  verified, reboot into the other slot, self-test passed after 2 s.
+- `ota check` on 1.4.2 takes the minimum free internal heap from 123 KB to
+  102 KB (a second check costs nothing more); on 1.4.1 the same request took
+  it from 118 KB to 75 KB. The remaining ~20 KB is the HTTP client, esp-tls
+  bookkeeping and the parsed release JSON.
+- Bastion relay, 4 MB from the PC to a LAN client through the board:
+  615 KB/s with TLS buffers in PSRAM, 629 KB/s before - within the run-to-run
+  noise of the Wi-Fi link. Internal heap minimum unchanged by the relay.
+- `logs previous` after the update shows the journal saved at "firmware
+  update" (31 lines, uptime 1607 s).
+- Version helpers checked on the host: `1.4.2+2ed1f89` matches tag `v1.4.2`,
+  `1.4.2-rc1` matches, `1.4.1` under tag `v1.4.2` is rejected, `1.4.10` is not
+  `1.4.1`, empty or non-numeric trailers are rejected.
+
 ## [1.4.1] - 2026-09-22
 
 ### Changed
