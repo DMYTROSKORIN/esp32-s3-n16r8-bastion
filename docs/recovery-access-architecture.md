@@ -34,7 +34,7 @@ memory or flash layout assumes exactly that part:
 | 16 MB flash, QIO @ 80 MHz | `default_16MB.csv`: two 6.25 MB OTA app slots (`app0`/`app1`), 3.4 MB SPIFFS (SSH host key), 64 KB coredump, NVS at 0x9000 (provisioned settings, learned MAC, boot counter). The stock `default_8MB.csv` of the DevKitC-1 board definition would waste half the chip. |
 | 8 MB PSRAM, OPI @ 80 MHz | `board_build.arduino.memory_type = qio_opi`; `heap_caps_malloc_extmem_enable(256)` sends every plain allocation of 256 B or more to PSRAM, which is what keeps libssh's per-packet buffers from fragmenting the ~320 KB of internal RAM under sustained traffic. The event journal (40 KB) and the per-session relay buffers (2 x 8 KB each) live there too. Internal RAM is reserved for what must be fast or DMA-capable: task stacks, static Wi-Fi buffers, lwIP's own pools. |
 | CPU 240 MHz, dual core | Core 0: Wi-Fi driver, lwIP `tcpip_thread`, SSH server task. Core 1: Arduino loop (LED, button, watchdog feed), `net-monitor`, `recovery-vpn`. |
-| Custom-built core | Arduino 3.3.11 / ESP-IDF 5.5.5 (pioarduino 55.03.311) with the IDF libraries rebuilt from source: lwIP TCP window and send buffer 32 KB, receive mailbox 32, SACK, `tcpip_thread` stack 6 KB, 12/64 static/dynamic Wi-Fi RX buffers, 16 static TX, BA window 24, dynamic Wi-Fi/lwIP pools in PSRAM, Wi-Fi/lwIP hot paths in IRAM, `-O2`. See `custom_sdkconfig` in `platformio.ini`. |
+| Custom-built core | Arduino 3.3.12 / ESP-IDF 5.5.5 (pioarduino 55.03.312) with the IDF libraries rebuilt from source: lwIP TCP window and send buffer 32 KB, receive mailbox 32, SACK, `tcpip_thread` stack 6 KB, 12/64 static/dynamic Wi-Fi RX buffers, 16 static TX, BA window 24, dynamic Wi-Fi/lwIP pools in PSRAM, Wi-Fi/lwIP hot paths in IRAM, `-O2`. See `custom_sdkconfig` in `platformio.ini`. |
 | Hardware AES / SHA / MPI | mbedTLS uses the S3's accelerators for AES (all SSH ciphers offered), SHA-256/512 (MACs, KEX hashes) and big-number math (ECDH). chacha20-poly1305 is not part of this libssh/mbedTLS build (the Arduino core omits mbedTLS's CHACHAPOLY module) and is not offered - see "SSH throughput" below. |
 
 The boot banner prints what it actually found (`flash 16 MB QIO @ 80 MHz |
@@ -173,7 +173,7 @@ labels, a green/yellow/red ● and state word per line, the facts you act on
 in bright white, rules as wide as the client's terminal):
 
 ```text
-  ESP32 Recovery Gateway   v1.4.0   ESP32-S3-N16R8  • reset: power-on
+  ESP32 Recovery Gateway   v1.4.1   ESP32-S3-N16R8  • reset: power-on
   ──────────────────────────────────────────────────────────────────────────────
   Device     ● ONLINE     up 0d 00:07:44
   Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39

@@ -39,25 +39,14 @@ jobs:
           key: pio-idf5-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
 
       - name: Install PlatformIO and signing dependencies
-        # Pinned: 6.1.19 is what the firmware is built and tested with locally
-        # and the core version platform 55.03.311 was released against.
-        run: pip install "platformio==6.1.19" cryptography
-
-      - name: Pin the pioarduino core inside the platform's penv
-        # pioarduino's HybridCompile step (rebuilding the IDF libraries with the
-        # project's sdkconfig) re-runs `pio` from the platform's own virtualenv,
-        # ~/.platformio/penv, which the platform seeds with `pioarduino>=6.1.19`,
-        # i.e. whatever is newest on PyPI. Since 2026-09-15 that is 6.2.0, which
-        # wants SCons 4.11.1 while platform 55.03.311 declares SCons 4.8.1; the
-        # mismatch deletes tool-scons mid-build and the outer build dies with
-        # "No module named 'SCons.Tool.FortranCommon'"
-        # (pioarduino/platform-espressif32#529). Creating the penv up front with
-        # pioarduino 6.1.19 satisfies the spec, so the platform leaves it alone.
-        # Drop this step once the platform is bumped to >= 55.03.312, which ships
-        # pioarduino 6.2.0 and SCons 4.11.1 consistently.
-        run: |
-          python -m venv --clear ~/.platformio/penv
-          ~/.platformio/penv/bin/pip install --quiet "pioarduino==6.1.19" uv
+        # Pinned to the core version platform 55.03.312 was released against.
+        # Keep this in step with the platform: pioarduino's HybridCompile
+        # re-runs `pio` from its own virtualenv (~/.platformio/penv, seeded with
+        # `pioarduino>=6.2.0` from PyPI), and if the outer core wants a
+        # different tool-scons than the platform declares, the mismatch deletes
+        # tool-scons mid-build ("No module named 'SCons.Tool.FortranCommon'",
+        # pioarduino/platform-espressif32#529).
+        run: pip install "platformio==6.2.0" cryptography
 
       - name: Build
         run: pio run -e esp32-s3-n16r8

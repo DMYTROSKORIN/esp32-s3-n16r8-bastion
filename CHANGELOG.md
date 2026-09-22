@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.1] - 2026-09-22
+
+### Changed
+
+- **Platform pioarduino 55.03.311 → 55.03.312** (Arduino core 3.3.11 →
+  3.3.12, ESP-IDF stays 5.5.5): pioarduino core 6.2.0, SCons 4.11.1, esptool
+  5.4.0, and the HybridCompile fix that names rebuilt IDF archives after the
+  link line (pioarduino/platform-espressif32#535). No firmware code changed.
+- **CI on PlatformIO 6.2.0**, matching the platform. The 6.1.19 pin from
+  1.4.0 stopped working on 2026-09-15: the platform seeds its own virtualenv
+  with `pioarduino>=6.1.19` from PyPI, which from that day resolved to 6.2.0
+  and its SCons 4.11.1, while platform 55.03.311 still declared SCons 4.8.1;
+  the mismatch deleted tool-scons mid-build
+  (pioarduino/platform-espressif32#529). Interim fix `4d2fd3a` pre-seeded
+  the virtualenv with pioarduino 6.1.19; the platform bump makes it
+  unnecessary.
+- GitHub Actions pinned to commit SHAs (actions/checkout 7.0.1,
+  setup-python 7.0.0, cache 6.1.0, upload-artifact 7.0.1,
+  softprops/action-gh-release 3.0.3), with Dependabot keeping the pins
+  current.
+
 ## [1.4.0] - 2026-09-06
 
 ### Added
