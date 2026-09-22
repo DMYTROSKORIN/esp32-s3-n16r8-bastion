@@ -75,6 +75,12 @@ every item below closes a gap a review found.
   noise of the Wi-Fi link. Internal heap minimum unchanged by the relay.
 - `logs previous` after the update shows the journal saved at "firmware
   update" (31 lines, uptime 1607 s).
+- Automatic update end to end: a board on 1.4.1 with `ota auto on` found
+  release v1.4.2 at its 2-minute release check, downloaded the 1.7 MB image in
+  20 s (GitHub's 302 to `objects.githubusercontent.com` followed, https
+  enforced on the hop), installed it into the other slot and confirmed it 2 s
+  after the reboot. That exercised 1.4.1's checker; the tag/version binding
+  added here runs for the first time at the next release.
 - Version helpers checked on the host: `1.4.2+2ed1f89` matches tag `v1.4.2`,
   `1.4.2-rc1` matches, `1.4.1` under tag `v1.4.2` is rejected, `1.4.10` is not
   `1.4.1`, empty or non-numeric trailers are rejected.
