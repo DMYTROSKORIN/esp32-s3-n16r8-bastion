@@ -173,7 +173,7 @@ labels, a green/yellow/red ● and state word per line, the facts you act on
 in bright white, rules as wide as the client's terminal):
 
 ```text
-  ESP32 Recovery Gateway   v1.4.1   ESP32-S3-N16R8  • reset: power-on
+  ESP32 Recovery Gateway   v1.4.2   ESP32-S3-N16R8  • reset: power-on
   ──────────────────────────────────────────────────────────────────────────────
   Device     ● ONLINE     up 0d 00:07:44
   Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
@@ -401,16 +401,17 @@ pair with `ota_sign.py keygen` and the header with `pubkey --header`.
 | Path | Command | Needs |
 |---|---|---|
 | Push over SSH | `ssh user@board ota < firmware-signed.bin` | the console reachable (LAN, WireGuard, or `-J`); no internet on the board |
-| Pull over HTTPS | `ota https://…/firmware-signed.bin` at the prompt | internet on the board; `https://` only, validated against the ESP-IDF CA bundle; up to 5 redirects (GitHub Releases redirect to `objects.githubusercontent.com`) |
+| Pull over HTTPS | `ota https://…/firmware-signed.bin` at the prompt | internet on the board; `https://` only - the initial URL and every redirect hop - validated against the ESP-IDF CA bundle; up to 5 redirects (GitHub Releases redirect to `objects.githubusercontent.com`) |
 
 Both feed the same streaming sink: bytes go to `esp_ota_write()` into the
 inactive slot as they arrive (sequential erase, so the first progress line
 appears immediately), SHA-256 is computed on the fly, and the last 96 bytes
 are held back as the trailer. Nothing is decided until the stream ends:
-then the signature is checked against the digest, `esp_ota_end()` runs
-ESP-IDF's own image validation (segments, checksum, embedded SHA-256), and
-only then `esp_ota_set_boot_partition()` points the bootloader at the new
-slot. A rejected image leaves the running firmware and the other slot
+then the signature is checked against the digest, the signed version field
+is compared with the release the image was fetched as (`ota upgrade` and
+automatic updates only, see below), `esp_ota_end()` runs ESP-IDF's own
+image validation (segments, checksum, embedded SHA-256), and only then
+`esp_ota_set_boot_partition()` points the bootloader at the new slot. A rejected image leaves the running firmware and the other slot
 untouched; the SSH exec exits with status 1 and the reason. Uploaded
 non-images are rejected on the first chunk (ESP image magic byte).
 
@@ -433,8 +434,17 @@ so that the `DeviceConfig` layout - and therefore existing provisioning -
 is untouched. With it on, a newer release is installed only when no SSH
 session is active; the checker re-tests every five minutes until the board
 is idle, so an update never ends a console or a relay under the owner.
-Everything else is the normal OTA path: signature check, image validation,
-self-test, rollback. The default is off: the board reports, the owner
+If the owner logs in during the download itself, the reboot into the new
+image waits for that session to end too. `ota auto off` while the checker
+is waiting cancels the install. Everything else is the normal OTA path:
+signature check, image validation, self-test, rollback - plus one check
+specific to tag-driven installs: the signed version field must name the
+same release (major.minor.patch) as the tag, otherwise the image is
+rejected before activation. The signature alone only proves the release
+key signed the image at some point; without the binding, an old but validly
+signed firmware re-uploaded under a newer tag - by someone with write
+access to the GitHub releases but no signing key - would have been
+installed as an "update". The default is off: the board reports, the owner
 decides.
 
 ### Self-test and rollback
@@ -465,9 +475,16 @@ exactly as after a USB flash; that state passes the self-test.
 
 ### Non-goals and limits
 
-- No downgrade protection: any correctly signed image installs, including
-  an older one - by design, so that a bad release can be undone by
-  installing the previous release the same way (or `ota rollback yes`).
+- No downgrade protection on the manual paths: `ota <url>` and
+  `ssh … ota < file` install any correctly signed image, including an older
+  one - by design, so that a bad release can be undone by installing the
+  previous release the same way (or `ota rollback yes`). Only the tag-driven
+  paths (`ota upgrade`, automatic updates) insist that the image is the
+  release its tag claims.
+- A client that connects but never authenticates occupies a session slot
+  for at most ~30 s (the authentication deadline) plus one 30 s message
+  timeout; with four slots, an attacker on the LAN or VPN can delay the
+  owner's login by about a minute per round, not deny it.
 - Only one image can be in flight at a time; a second `ota` from another
   session is refused with "another firmware update is already in progress".
   Other sessions keep working while an image is being received (10-20 s on

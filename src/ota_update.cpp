@@ -76,6 +76,51 @@ void setResult(OtaResult& result, bool ok, const char* format, ...) {
   va_end(args);
 }
 
+// "v1.4.0", "1.4.0+ota1", "1.4.0-rc1" -> {1,4,0}. Returns false on garbage.
+bool parseVersion(const char* text, int out[3]) {
+  if (text == nullptr) {
+    return false;
+  }
+  if (*text == 'v' || *text == 'V') {
+    ++text;
+  }
+  out[0] = out[1] = out[2] = 0;
+  int part = 0;
+  bool digits = false;
+  for (; *text != '\0'; ++text) {
+    if (*text >= '0' && *text <= '9') {
+      out[part] = out[part] * 10 + (*text - '0');
+      digits = true;
+    } else if (*text == '.' && part < 2 && digits) {
+      ++part;
+      digits = false;
+    } else {
+      break;  // Pre-release / build metadata: ignored for ordering.
+    }
+  }
+  return part >= 1 || digits;
+}
+
+bool isNewerVersion(const char* candidate, const char* current) {
+  int a[3], b[3];
+  if (!parseVersion(candidate, a) || !parseVersion(current, b)) {
+    return false;
+  }
+  for (int i = 0; i < 3; ++i) {
+    if (a[i] != b[i]) {
+      return a[i] > b[i];
+    }
+  }
+  return false;
+}
+
+// Same major.minor.patch; build metadata ("1.4.1+2ed1f89") does not count.
+bool sameReleaseVersion(const char* a, const char* b) {
+  int va[3], vb[3];
+  return parseVersion(a, va) && parseVersion(b, vb) && va[0] == vb[0] && va[1] == vb[1] &&
+         va[2] == vb[2];
+}
+
 const char* stateName(esp_ota_img_states_t state) {
   switch (state) {
     case ESP_OTA_IMG_NEW:
@@ -118,6 +163,7 @@ struct OtaSink::Impl {
   size_t tailLength = 0;
   size_t imageBytes = 0;
   bool imageStartChecked = false;
+  char expectedVersion[kOtaVersionFieldSize + 1] = {};
 
   bool commitImageBytes(const uint8_t* data, size_t length, OtaResult& result) {
     if (length == 0) {
@@ -155,6 +201,14 @@ OtaSink::~OtaSink() {
 
 bool OtaSink::begin(OtaResult& result) {
   result = OtaResult{};
+  if (selfTestPending.load()) {
+    // esp_ota_begin() would refuse anyway (ESP_ERR_OTA_ROLLBACK_INVALID_STATE:
+    // the other slot is still this image's fallback), just less readably.
+    setResult(result, false,
+              "the running image is still in its post-update self-test; retry once "
+              "`ota status` reports it confirmed");
+    return false;
+  }
   bool expected = false;
   if (!otaInProgress.compare_exchange_strong(expected, true)) {
     setResult(result, false, "another firmware update is already in progress");
@@ -188,6 +242,11 @@ bool OtaSink::begin(OtaResult& result) {
   impl_->imageStartChecked = false;
   received_ = 0;
   return true;
+}
+
+void OtaSink::expectVersion(const char* version) {
+  snprintf(impl_->expectedVersion, sizeof(impl_->expectedVersion), "%s",
+           version != nullptr ? version : "");
 }
 
 bool OtaSink::feed(const uint8_t* data, size_t length, OtaResult& result) {
@@ -269,6 +328,16 @@ bool OtaSink::finish(OtaResult& result) {
     return false;
   }
 
+  if (impl_->expectedVersion[0] != '\0' &&
+      !sameReleaseVersion(result.version, impl_->expectedVersion)) {
+    setResult(result, false,
+              "image is signed as v%s but was fetched as release v%s - refusing to "
+              "install a release under the wrong tag",
+              result.version, impl_->expectedVersion);
+    abort();
+    return false;
+  }
+
   // ESP-IDF's own validation: segment layout, checksum, the image's SHA-256.
   esp_err_t err = esp_ota_end(impl_->handle);
   impl_->active = false;
@@ -324,7 +393,8 @@ void report(OtaReportFn fn, void* userData, const char* format, ...) {
 }
 }  // namespace
 
-bool otaFromUrl(const char* url, OtaReportFn reportFn, void* userData, OtaResult& result) {
+bool otaFromUrl(const char* url, OtaReportFn reportFn, void* userData, OtaResult& result,
+                const char* expectedVersion) {
   result = OtaResult{};
   if (url == nullptr || strncmp(url, "https://", 8) != 0) {
     setResult(result, false, "only https:// URLs are accepted");
@@ -371,6 +441,16 @@ bool otaFromUrl(const char* url, OtaReportFn reportFn, void* userData, OtaResult
         status == 308) {
       esp_http_client_set_redirection(client);
       esp_http_client_close(client);
+      {
+        // The https-only rule must survive the hop: a Location header
+        // pointing at plain http would otherwise fetch the image in clear.
+        char location[256];
+        if (esp_http_client_get_url(client, location, sizeof(location)) != ESP_OK ||
+            strncmp(location, "https://", 8) != 0) {
+          setResult(result, false, "redirect to a non-https URL refused");
+          goto done;
+        }
+      }
       report(reportFn, userData, "Redirect %d, following (%d/%d)", status, hop + 1,
              kMaxRedirects);
       if (hop == kMaxRedirects) {
@@ -399,6 +479,9 @@ bool otaFromUrl(const char* url, OtaReportFn reportFn, void* userData, OtaResult
     OtaSink sink;
     if (!sink.begin(result)) {
       goto done;
+    }
+    if (expectedVersion != nullptr) {
+      sink.expectVersion(expectedVersion);
     }
     report(reportFn, userData, "Writing into %s ...", result.targetLabel);
     size_t lastReported = 0;
@@ -609,44 +692,6 @@ void ensureUpdateMutex() {
   }
 }
 
-// "v1.4.0", "1.4.0+ota1", "1.4.0-rc1" -> {1,4,0}. Returns false on garbage.
-bool parseVersion(const char* text, int out[3]) {
-  if (text == nullptr) {
-    return false;
-  }
-  if (*text == 'v' || *text == 'V') {
-    ++text;
-  }
-  out[0] = out[1] = out[2] = 0;
-  int part = 0;
-  bool digits = false;
-  for (; *text != '\0'; ++text) {
-    if (*text >= '0' && *text <= '9') {
-      out[part] = out[part] * 10 + (*text - '0');
-      digits = true;
-    } else if (*text == '.' && part < 2 && digits) {
-      ++part;
-      digits = false;
-    } else {
-      break;  // Pre-release / build metadata: ignored for ordering.
-    }
-  }
-  return part >= 1 || digits;
-}
-
-bool isNewerVersion(const char* candidate, const char* current) {
-  int a[3], b[3];
-  if (!parseVersion(candidate, a) || !parseVersion(current, b)) {
-    return false;
-  }
-  for (int i = 0; i < 3; ++i) {
-    if (a[i] != b[i]) {
-      return a[i] > b[i];
-    }
-  }
-  return false;
-}
-
 // GET a small HTTPS document into a PSRAM buffer. Returns bytes read, -1 on
 // error (message in `error`).
 int httpsGet(const char* url, char* buffer, size_t capacity, char* error, size_t errorSize) {
@@ -809,15 +854,36 @@ void updateCheckerTask(void*) {
     }
     // Automatic install: only when nobody is logged in, so an update never
     // yanks a console or a bastion relay out from under the owner. Retry
-    // every 5 minutes until the board is idle.
+    // every 5 minutes until the board is idle; `ota auto off` typed in the
+    // meantime cancels the install instead of being ignored.
+    bool cancelled = false;
     while (sshActiveSessions() > 0) {
       eventLogf("OTA: v%s ready to install, waiting for %u active session(s) to end",
                 info.latestVersion, sshActiveSessions());
       delay(5 * 60 * 1000);
+      if (!otaAutoUpdateEnabled()) {
+        cancelled = true;
+        break;
+      }
+    }
+    if (cancelled) {
+      eventLogf("OTA: automatic updates were switched off while waiting; not installing");
+      continue;
     }
     eventLogf("OTA: installing v%s automatically", info.latestVersion);
     OtaResult result;
-    if (otaFromUrl(info.url, checkerReport, nullptr, result)) {
+    // The signed trailer must carry the release the tag promised: the
+    // signature alone would also accept an old firmware re-published as
+    // "newer", i.e. a downgrade dressed up as an update.
+    if (otaFromUrl(info.url, checkerReport, nullptr, result, info.latestVersion)) {
+      // Someone may have logged in during the ~20 s download; the image is
+      // written and selected for the next boot either way, so give that
+      // session the same courtesy and reboot once the board is idle again.
+      while (sshActiveSessions() > 0) {
+        eventLogf("OTA: v%s installed, rebooting once %u active session(s) end",
+                  result.version, sshActiveSessions());
+        delay(30 * 1000);
+      }
       eventLogf("OTA: %s - rebooting into it", result.message);
       eventLogPersist("automatic update");
       delay(1000);

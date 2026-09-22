@@ -50,6 +50,12 @@ constexpr uint32_t kRelayIdleTimeoutMs = 10 * 60 * 1000;
 // room to clear while still catching a genuinely gone client reasonably fast.
 constexpr uint32_t kRelayWriteStallTimeoutMs = 30000;
 constexpr uint8_t kMaxAuthMessages = 16;
+// Wall-clock cap on the whole authentication exchange. kMaxAuthMessages alone
+// let a client that never authenticates hold a session slot for 16 x the 30 s
+// per-message timeout - eight minutes - and four such connections (LAN or
+// VPN, no key needed) would keep the owner out of the console for that long,
+// again and again. 30 s is generous for an agent trying several keys.
+constexpr uint32_t kAuthDeadlineMs = 30000;
 constexpr uint32_t kWatchRefreshMs = 2000;
 constexpr uint8_t kHistoryDepth = 8;
 constexpr size_t kMaxLineLength = 127;
@@ -951,7 +957,7 @@ bool cmdOta(ssh_channel channel, const char* args) {
     channelPrintf(channel, "\r\nInstalling v%s from %s\r\n", info.latestVersion, info.url);
     eventLogf("OTA: upgrade to v%s requested by %s", info.latestVersion, peerName());
     OtaResult result;
-    if (!otaFromUrl(info.url, otaReportToChannel, channel, result)) {
+    if (!otaFromUrl(info.url, otaReportToChannel, channel, result, info.latestVersion)) {
       channelPrintf(channel, "\r\nUpdate failed: %s\r\nThe running firmware is unchanged.\r\n",
                     result.message);
       return true;
@@ -1094,7 +1100,13 @@ void runExecCommand(ssh_channel channel, const String& command) {
     receiveOtaFromChannel(channel);
     return;
   }
-  eventLogf("SSH: exec '%s' from %s", trimmed.c_str(), peerName());
+  // The journal is secrets-free by contract; an `ota https://user:token@...`
+  // URL typed on the command line must not end up in it verbatim.
+  if (trimmed.startsWith("ota https://")) {
+    eventLogf("SSH: exec 'ota <url>' from %s", peerName());
+  } else {
+    eventLogf("SSH: exec '%s' from %s", trimmed.c_str(), peerName());
+  }
   executeCommand(channel, trimmed);
   ssh_channel_request_send_exit_status(channel, 0);
 }
@@ -1628,7 +1640,11 @@ void hardenSessionTransport(ssh_session session) {
 }
 
 bool authenticateSession(ssh_session session) {
+  const uint32_t startedMs = millis();
   for (uint8_t attempt = 0; attempt < kMaxAuthMessages; ++attempt) {
+    if (millis() - startedMs > kAuthDeadlineMs) {
+      return false;
+    }
     ssh_message message = ssh_message_get(session);
     if (message == nullptr) {
       return false;

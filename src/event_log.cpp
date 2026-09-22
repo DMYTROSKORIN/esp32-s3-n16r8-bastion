@@ -24,6 +24,11 @@ size_t count = 0;  // Retained entries.
 uint32_t sequence = 0;  // Lines written since boot.
 uint32_t lastPersistMs = 0;
 SemaphoreHandle_t mutex = nullptr;
+// Serialises writers of the snapshot file: the periodic snapshot (net-monitor
+// task) and a planned-restart snapshot (an SSH session task, the update
+// checker) can coincide, and two writers on one temp file produce an
+// interleaved journal that the rename then promotes as the "previous" one.
+SemaphoreHandle_t persistMutex = nullptr;
 
 void stampUptime(char* out, size_t outSize) {
   const uint64_t ms = static_cast<uint64_t>(esp_timer_get_time()) / 1000ULL;
@@ -46,6 +51,7 @@ void eventLogInit() {
     lines = static_cast<char (*)[kLineSize]>(calloc(kCapacity, kLineSize));
   }
   mutex = xSemaphoreCreateMutex();
+  persistMutex = xSemaphoreCreateMutex();
 }
 
 void eventLogf(const char* format, ...) {
@@ -126,7 +132,8 @@ void persistLine(const char* line, void* userData) {
 }
 }  // namespace
 
-bool eventLogPersist(const char* reason) {
+namespace {
+bool persistLocked(const char* reason) {
   if (!SPIFFS.begin(true)) {
     return false;
   }
@@ -149,6 +156,19 @@ bool eventLogPersist(const char* reason) {
   SPIFFS.remove(kPreviousPath);
   const bool ok = SPIFFS.rename("/journal.tmp", kPreviousPath);
   lastPersistMs = millis();
+  return ok;
+}
+}  // namespace
+
+bool eventLogPersist(const char* reason) {
+  // A snapshot takes well under a second; a caller that cannot get the lock
+  // within 5 s is racing a stuck SPIFFS and had better not pile on.
+  if (persistMutex == nullptr ||
+      xSemaphoreTake(persistMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    return false;
+  }
+  const bool ok = persistLocked(reason);
+  xSemaphoreGive(persistMutex);
   return ok;
 }
 

@@ -4,6 +4,64 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.2] - 2026-09-22
+
+Fourth review pass, this time over everything added since the August
+reliability audits (OTA, signed updates, concurrent sessions, the release
+check, journal persistence). No functional change for a normally used board;
+every item below closes a gap a review found.
+
+### Security
+
+- **Release tag bound to the signed version.** `ota upgrade` and automatic
+  updates now require the image's signed 32-byte version field to name the
+  same release (major.minor.patch) as the tag it was fetched under, checked
+  after the signature and *before* the slot is activated. The signature alone
+  proved only that the release key had signed the image at some point: an
+  old, validly signed firmware re-uploaded under a newer tag would have been
+  installed as an "update", i.e. a downgrade to a known-vulnerable build by
+  anyone who can edit the GitHub release but does not hold the signing key.
+  `ota <url>` and `ssh ... ota < file` are unchanged: they are the owner's
+  deliberate choice of image, including intentional downgrades.
+- **Redirects stay on https.** `ota <url>` refused plain-http URLs but
+  followed a `Location:` header wherever it pointed; a hop to `http://` is now
+  rejected.
+- **Authentication deadline.** A client that never authenticated could hold a
+  session slot for 16 messages x the 30 s per-message timeout - eight minutes
+  - and four such connections from the LAN or VPN (no key needed) locked the
+  owner out of the console for that long, repeatably. The whole
+  authentication exchange is now capped at 30 s.
+- The journal is secrets-free by contract, but `ssh board ota https://...`
+  logged the URL verbatim, credentials in the URL included. Exec commands
+  starting with `ota https://` are logged as `ota <url>`.
+
+### Fixed
+
+- Two tasks could snapshot the journal to SPIFFS at the same time (the
+  10-minute periodic snapshot and a reboot/OTA/rollback snapshot from an SSH
+  session or the update checker), interleaving their lines in one temp file
+  that the rename then promoted as `logs previous`. Snapshots are serialised.
+- `ota auto off` typed while the checker was already waiting for the console
+  to go idle was ignored: the install went ahead once the session ended. The
+  wait loop re-reads the setting and cancels.
+- An automatic install that finished while a session had logged in during
+  the ~20 s download rebooted the board under that session. The reboot now
+  waits for the console to be idle again, exactly like the install itself.
+- `ota` during the first two minutes after an update, while the new image is
+  still in its self-test, failed with the opaque
+  `esp_ota_begin(app1) failed: ESP_ERR_OTA_ROLLBACK_INVALID_STATE`; it now
+  says the image is still being confirmed and to retry after `ota status`.
+
+### Changed
+
+- **TLS buffers moved out of internal RAM.** With ESP-IDF's default
+  `MBEDTLS_INTERNAL_MEM_ALLOC` a single HTTPS request - the daily release
+  check, `ota check`, `ota <url>` - took the minimum free internal heap from
+  118 KB to 75 KB (measured on 1.4.1), into the range the dashboard flags as
+  `TIGHT`, while three SSH sessions and a relay compete for the same heap.
+  `MBEDTLS_DEFAULT_MEM_ALLOC` lets the 256-byte PSRAM threshold that already
+  governs libssh apply to mbedTLS as well.
+
 ## [1.4.1] - 2026-09-22
 
 ### Changed

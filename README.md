@@ -5,7 +5,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.4.1-2ea44f.svg"></a>
+  <a href="CHANGELOG.md"><img alt="Version" src="https://img.shields.io/badge/firmware-v1.4.2-2ea44f.svg"></a>
   <a href=".github/workflows/build.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/DMYTROSKORIN/esp32-s3-n16r8-bastion/build.yml?branch=main&label=build"></a>
   <img alt="Platform" src="https://img.shields.io/badge/board-ESP32--S3--N16R8%20only-e07020.svg">
   <img alt="Framework" src="https://img.shields.io/badge/framework-Arduino%20%2F%20PlatformIO-00979d.svg">
@@ -70,7 +70,7 @@ before attempting a port.
 The SSH console opens straight into a live status dashboard — no separate monitoring needed:
 
 ```text
-  ESP32 Recovery Gateway   v1.4.1   ESP32-S3-N16R8  • reset: power-on
+  ESP32 Recovery Gateway   v1.4.2   ESP32-S3-N16R8  • reset: power-on
   ──────────────────────────────────────────────────────────────────────────────
   Device     ● ONLINE     up 0d 00:07:44
   Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
@@ -186,11 +186,12 @@ ssh user@10.66.0.2 ota < firmware-signed.bin
 or let the board fetch it itself, from the console:
 
 ```text
-recovery> ota https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases/download/v1.4.1/firmware-signed.bin
+recovery> ota https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases/download/v1.4.2/firmware-signed.bin
 ```
 
 Either way the image streams into the inactive OTA slot, is verified (Ed25519 release signature +
-ESP-IDF image check) and only then activated; the board reboots and the new image must bring up
+ESP-IDF image check; for `ota upgrade` and automatic updates the signed version must also be the
+release the tag promised) and only then activated; the board reboots and the new image must bring up
 Wi-Fi and SSH within two minutes or the bootloader rolls back to the previous one on its own. Your
 settings, WireGuard profiles, learned MAC and SSH host key are not touched. `ota status` shows both
 slots and the outcome of the last update; `ota rollback yes` returns to the other slot by hand.
@@ -276,7 +277,7 @@ indefinitely, cheap enough to be an easy insurance policy against exactly that d
 | | |
 |---|---|
 | Board | **ESP32-S3-N16R8** (16 MB QIO flash, 8 MB OPI PSRAM), DevKitC-1 class — the only supported variant |
-| Firmware | v1.4.1 — see [CHANGELOG.md](CHANGELOG.md); signed OTA images on every [release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) |
+| Firmware | v1.4.2 — see [CHANGELOG.md](CHANGELOG.md); signed OTA images on every [release](https://github.com/DMYTROSKORIN/esp32-s3-n16r8-bastion/releases) |
 | Framework | Arduino core 3.3.12 / ESP-IDF 5.5.5 via [pioarduino](https://github.com/pioarduino/platform-espressif32) 55.03.312, IDF rebuilt with `custom_sdkconfig`, `-O2` |
 | CI | [GitHub Actions](.github/workflows/build.yml) builds on every push, signs the OTA image and publishes the release assets on `v*` tags |
 | SSH server | [LibSSH-ESP32](https://github.com/ewpa/LibSSH-ESP32) (Arduino port of libssh) |

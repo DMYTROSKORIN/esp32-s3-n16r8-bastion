@@ -27,7 +27,7 @@ white for the facts you act on and cyan for labels and command hints. The
 `recovery>` prompt is bold green.
 
 ```text
-  ESP32 Recovery Gateway   v1.4.1   ESP32-S3-N16R8  • reset: power-on
+  ESP32 Recovery Gateway   v1.4.2   ESP32-S3-N16R8  • reset: power-on
   ──────────────────────────────────────────────────────────────────────────────
   Device     ● ONLINE     up 0d 00:07:44
   Wi-Fi      ● ONLINE     MyHomeWiFi  -51 dBm  ch 6  ip 192.168.1.120  up 0d 00:07:39
@@ -96,7 +96,7 @@ handlers, so this output cannot drift from what the firmware does. The
 actual `help` output in the current firmware:
 
 ```text
-ESP32 Recovery Gateway v1.4.1 - command reference
+ESP32 Recovery Gateway v1.4.2 - command reference
 
 STATUS
   status               Show the complete dashboard
@@ -302,7 +302,7 @@ whether or not automatic updates are on:
 recovery> ota check
 
 Asking GitHub Releases ...
-Latest release: v1.5.0. Running: v1.4.1. An update is available - `ota upgrade` installs it.
+Latest release: v1.5.0. Running: v1.4.2. An update is available - `ota upgrade` installs it.
 ```
 
 A successful update ends like this, then the connection closes and the board

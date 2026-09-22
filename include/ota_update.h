@@ -42,6 +42,12 @@ class OtaSink {
   OtaSink();
   ~OtaSink();
   bool begin(OtaResult& result);
+  // Optional policy, set between begin() and finish(): the signed trailer's
+  // version must be the same release (major.minor.patch) as `version`, the
+  // tag the image was fetched as. The signature only proves the image came
+  // from the release key; without this check a validly signed *older*
+  // firmware re-uploaded under a newer tag would be installed as an update.
+  void expectVersion(const char* version);
   bool feed(const uint8_t* data, size_t length, OtaResult& result);
   // Verifies the trailer signature and the image, activates the slot.
   // The caller reboots afterwards.
@@ -56,10 +62,12 @@ class OtaSink {
   size_t received_ = 0;
 };
 
-// Downloads `url` (https:// only, public CA bundle) and applies it.
-// `report` receives progress lines. Returns result.ok; reboot is left to the
-// caller so it can print the outcome first.
-bool otaFromUrl(const char* url, OtaReportFn report, void* userData, OtaResult& result);
+// Downloads `url` (https:// only, also across redirects, public CA bundle)
+// and applies it. `report` receives progress lines. `expectedVersion`, when
+// given, is enforced as OtaSink::expectVersion(). Returns result.ok; reboot is
+// left to the caller so it can print the outcome first.
+bool otaFromUrl(const char* url, OtaReportFn report, void* userData, OtaResult& result,
+                const char* expectedVersion = nullptr);
 
 // Fills a multi-line human-readable slot summary ("ota status").
 void otaDescribeSlots(char* out, size_t outSize);
