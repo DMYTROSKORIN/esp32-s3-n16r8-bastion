@@ -25,6 +25,15 @@ All notable changes to this project are documented here. The format follows
   softprops/action-gh-release 3.0.3), with Dependabot keeping the pins
   current.
 
+### Tested on the bench
+
+- CI image `1.4.1+2ed1f89` (Arduino 3.3.12 core) installed over SSH onto a
+  board running 1.4.0: 1.7 MB received and verified, reboot into the other
+  slot, self-test passed after 2 s, image confirmed. Wi-Fi up at 2.8 s, SSH
+  at 3.3 s, WireGuard handshake at 13 s; heap 124 KB free (min 119), PSRAM
+  8098/8192 KB free; `ota check` reports "up to date". Binary 1734513 B, 5 KB
+  smaller than the 3.3.11 build.
+
 ## [1.4.0] - 2026-09-06
 
 ### Added
