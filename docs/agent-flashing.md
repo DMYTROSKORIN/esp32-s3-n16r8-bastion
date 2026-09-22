@@ -62,7 +62,12 @@ The first build downloads the ESP-IDF toolchain and **compiles the whole ESP-IDF
 (pioarduino HybridCompile with the project's `custom_sdkconfig`), then libssh and the WireGuard
 stack: expect 10-20 minutes and a couple of GB under `~/.platformio`. Do not interrupt it; the IDF
 libraries are cached afterwards and later builds take seconds. If you changed `custom_sdkconfig`,
-delete the generated `sdkconfig.esp32-s3-n16r8` first, otherwise the old configuration is reused.
+delete the generated `sdkconfig.defaults` (and `sdkconfig.esp32-s3-n16r8` if present) first: the
+platform decides whether to rebuild the IDF libraries by a hash it keeps in the first line of
+`sdkconfig.defaults`, and without that step the old configuration is reused. If the very first build
+after a platform bump in `platformio.ini` dies with `No module named 'SCons.Tool.FortranCommon'`, run
+it once more: the platform upgraded its own pioarduino core inside `~/.platformio/penv` mid-build and
+the second run uses it consistently.
 A warning about `ssh_message_auth_pubkey`/`ssh_message_auth_publickey_state` being deprecated is
 expected (it's a pre-existing LibSSH-ESP32 API deprecation, not something you introduced) — an
 actual build failure is not. Treat any `error:` line, especially around `std::atomic` copy
